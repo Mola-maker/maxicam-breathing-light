@@ -15,8 +15,8 @@ MaixCAM 语音门控呼吸灯项目，以及相关的参考代码、协议笔记
 
 ## 说明
 
-- `surplife/` 是 2026-10-25 主机端快照；板子上的模型文件不在仓库内。
-- 运行时从 `/root/models/am_3332_192_int8.mud` 加载 KWS 模型，对应的 `.cvimodel` 也未放入仓库。
+- `surplife/` 主体是 2026-10-25 主机端快照；其中 `app/voice_pwm.py` 已在 2026-10-27 同步到板端 **v0.2.7**（10s 肺活量彩蛋），v0.2.5 原文件放在 `surplife/archive/voice_pwm.py.v025`。
+- 板子上的模型文件不在仓库内；运行时从 `/root/models/am_3332_192_int8.mud` 加载 KWS 模型，对应的 `.cvimodel` 也未放入仓库。
 - 为控制仓库体积和避免公开运行录音，已排除：
   - `lib/`、`wheels/` 依赖目录
   - `__pycache__/`、`*.pyc`

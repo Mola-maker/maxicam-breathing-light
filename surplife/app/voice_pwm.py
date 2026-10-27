@@ -3,34 +3,69 @@
 MaixCAM Pro 语音门控 18 kHz PWM 灯控
 
 业务:
-    "长春" (chang2 chun1) 是门, 语音模型识别到后从待机进入业务状态。
-    独立音量线程持续监听麦克风, 只做轻量 RMS 包络; 门控后:
-        - 业务态 100% -> 35% -> STANDBY_MAX, 再进入呼吸
-        - A19/PWM7 作为频率给定/方波/mirror 辅助输出
-    门控后从当前 PWM 亮度经 0.1 秒贝塞尔曲线直接升到 100%;
+    语音门改成"单字/整词识别 + 时序拼装"两段:
+        1. 识别段注册八个单字关键词:
+           chang1/chang2/chang4, chun1/chun2/chun3, ang1/ang2。
+           (模型词表没有 chun4, 实测会报 parse kws error; chun3 可用)
+           另外注册一个整词关键词 "chang2 chun1"（Maix-Speech 支持空格分隔的
+           多音节拼音）。连续说"长春"时单字 KWS 经常只上报其中一个字，整词
+           KWS 可以直接给出高概率；拖长"长～～春"仍走单字拼装。
+        2. 判断段:
+           - 整词 phrase 概率 >= 0.30: 直接开门；
+           - 否则按单字序列: chang 后出现 chun，拼装分取两字置信度的 max；
+           - 拖长“长～～春”时如果只报 chun：本次连续人声（RMS >= 0.03）
+             在 chun 前已持续 >= 0.80s，则把长前导当作拖长的“长”；
+             此时 chun 只需 >= 0.10（拖长会使 chun 概率明显下降）即开门；
+             单独短促的“春”不满足“连续人声 >= 0.80s”；
+           - 只出现 ang、顺序不对、超时或置信度不足时保持关灯。
+    门控后从当前 PWM 亮度经 0.03 秒贝塞尔曲线直接升到 100%;
     之后保持 100%, 直到 env_fast < 本次最大声强的 15% 且持续 0.05 秒;
-    拖音 "un-----" 期间由 en1 拖音评分决定是否继续 100%; 分数低则提前退出;
-    释放后再走 2.3 秒斜坡:
+    拖音 "un-----" 期间只由声强包络保持: env_fast >= 本次峰值的 15% 时继续 100%;
+    释放后再走 2.5 秒斜坡:
         100% -> 50% 0.5 秒, 50% -> 35% 0.8 秒 (三次贝塞尔, 先快后慢);
-        35% -> STANDBY_MAX(16%) 1 秒线性;
-        到 16% 后从呼吸最大值进入待机呼吸, 不再跳变。
+        35% -> STANDBY_MAX(8%) 1.2 秒线性;
+        到 8% 后从呼吸最大值进入待机呼吸, 不再跳变。
 
 关键点:
-    nn.Speech.run() 会长时间占用 Python GIL。因此 PWM 控制和音量 DSP
-    都放在独立进程里, 主进程只负责 KWS, 保证 100 Hz 的 PWM 更新不被阻塞。
+    实测 nn.Speech.run() 会持续持有 Python GIL, 同进程的 Python 线程无法
+    在推理期间得到调度。因此逻辑上仍分成"识别"和"判断"两段, 但为了真正
+    用满两个核, 判断段放在独立子进程; 识别到单字后通过 Pipe 实时送出。
+    PWM 控制和音量 DSP 继续放在独立进程里, 保证 100 Hz 的 PWM 更新不被阻塞。
 
 硬件:
     A18 -> PWM6 -> /sys/class/pwm/pwmchip4/pwm2
     A19 -> PWM7 -> /sys/class/pwm/pwmchip4/pwm3
     载波 18 kHz, duty 0~100%。
+    注意: A18/A19 是 3.3V 逻辑 PWM, 必须经过 MOSFET/驱动级,
+    不得直接接灯珠或大电流负载。
 
 环境变量:
     VOICE_AM_MODEL        KWS 声学模型, 默认 /root/models/am_3332_192_int8.mud
-    VOICE_KEYWORD_PINYIN  关键词拼音, 默认 "chang2 chun1"
-    VOICE_GATE_THRESHOLD  门限概率, 默认 0.5
-    VOICE_GATE_REARM      概率回落到该值以下才重新武装, 默认 0.28 (无时间不应期)
-    VOICE_ALSA_DEVICE     默认 pwm_mic (见 /root/.asoundrc)
-    VOICE_TAP_FIFO        默认 /root/surplife/run/surplife_pwm_mic.pcm
+    VOICE_GATE_THRESHOLD  单字两字阈值的门限, 默认 0.35
+    VOICE_PHRASE_THRESHOLD 整词 chang2 chun1 的门限, 默认 0.30
+    VOICE_CHAR_THRESHOLD  单字送入判断段的概率门限, 默认 0.10
+    VOICE_CHAR_DEBOUNCE   同一字族重复上报的最小间隔, 默认 0.18 秒
+    VOICE_PHRASE_DEBOUNCE 整词重复上报的最小间隔, 默认 2.0 秒
+    VOICE_SEQ_WINDOW      chang 到 chun 的可选最大间隔, 默认 0 (不限时);
+                          正数表示超过该秒数后丢弃旧 chang
+    VOICE_LONG_PREFIX_SECONDS 只报 chun 时，判为拖长“长”前导的最小连续
+                          人声时长, 默认 0.80 秒
+    VOICE_LONG_PREFIX_RMS 累计“长前导”所用的 RMS 门限, 默认 0.030
+    VOICE_LONG_PREFIX_MIN_CONF 长前导成立时 chun 的最低置信度, 默认 0.10;
+                          拖得越长 KWS 的 chun 概率会下降，因此这里低于 0.35
+
+    VOICE_GATE_COOLDOWN   开门后抑制重复序列的冷却时间, 默认 1.0 秒
+
+    VOICE_EGG_HOLD_SECONDS 连续人声达到该秒数触发 10s 彩蛋, 默认 10.0
+    VOICE_EGG_FLASH_SECONDS 彩蛋亮灭段总时长, 默认 1.6
+    VOICE_EGG_CYCLE_SECONDS 彩蛋单个亮灭周期, 默认 0.2 (亮 0.1 + 灭 0.1)
+    VOICE_EGG_OFF_SECONDS 彩蛋亮灭后全灭时长, 默认 2.0
+    VOICE_EGG_BRIGHT      彩蛋亮起占空比, 默认 100 %
+    VOICE_EGG_TEST_AFTER  仅测试: 启动 N 秒后注入一次彩蛋, 默认 0 关闭
+
+    VOICE_ALSA_DEVICE     默认 surplife_mic (见 /root/.asoundrc)
+    VOICE_INPUT_WAV       可选: 指定 WAV 文件用于离线调试 (DEVICE_WAV)
+    VOICE_TAP_FIFO        默认 /root/surplife/run/surplife_mic.pcm
 
     PWM_FREQ              载波频率, 默认 18000
     PWM_UPDATE_HZ         PWM 更新率, 默认 100
@@ -39,21 +74,15 @@ MaixCAM Pro 语音门控 18 kHz PWM 灯控
     A18_BLINK             1 = A18 也按闪烁频率做亮灭翻转, 默认 0
     BLINK_HZ_MIN/MAX      闪烁频率范围, 默认 1 / 8 Hz
     BLINK_INVERT          1 = 声量越大闪得越慢
-    STANDBY_MIN/MAX       待机呼吸占空比, 默认 2 / 16 %
+    STANDBY_MIN/MAX       待机呼吸占空比, 默认 1 / 8 %
     STANDBY_PERIOD        待机呼吸周期, 默认 4 秒
     BUSINESS_MIN/MAX      业务映射范围 (实机斜坡从 MAX 到阈值), 默认 40 / 100 %
-    BUSINESS_INTRO_SECONDS 门控后当前亮度->INTRO_TARGET 的贝塞尔上升时长, 默认 0.10 秒
+    BUSINESS_INTRO_SECONDS 门控后当前亮度->INTRO_TARGET 的贝塞尔上升时长, 默认 0.03 秒
     BUSINESS_INTRO_TARGET 门控上升目标亮度, 默认 100 %
     BUSINESS_BEZIER_SECONDS 100%->35% 贝塞尔段时长, 默认 1.3 秒 (100->50: 0.5s, 50->35: 0.8s)
-    BUSINESS_LINEAR_SECONDS 35%->STANDBY_MAX 线性段时长, 默认 1.0 秒
+    BUSINESS_LINEAR_SECONDS 35%->STANDBY_MAX 线性段时长, 默认 1.2 秒
     BUSINESS_HOLD_RATIO  拖音保持释放阈值 (×本次峰值), 默认 0.15
     BUSINESS_HOLD_RELEASE_SECONDS 低于阈值持续多久后释放, 默认 0.05 秒
-    UN_CANDIDATE         拖音候选词, 默认 en1 (作为第二路 KWS)
-    UN_SCORE_ENABLE      1=启用拖音评分门控, 0=只记录不干预
-    UN_SCORE_MIN_SECONDS 门控后至少观察多久再判断评分, 默认 0.40 秒
-    UN_SCORE_RELEASE     评分低于该值则释放, 默认 0.45
-    UN_MATCH_MIN         候选词匹配概率低于该值则释放, 默认 0.03
-    UN_SCORE_RELEASE_SECONDS 低分持续多久后释放, 默认 0.12 秒
     LIGHT_THRESHOLD       业务斜坡终点/回待机阈值, 默认 35 %
     DECAY_TICK_MS         演示模式“每 tick”时长, 默认 20 ms
     WORK_DECAY_PER_TICK   仅 PWM_DEMO 使用, 默认 1
@@ -128,7 +157,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 def breathing_duty(t: float, period: float = 4.0,
-                   lo: float = 2.0, hi: float = 16.0) -> float:
+                   lo: float = 1.0, hi: float = 8.0) -> float:
     """待机慢速呼吸: 从 lo 开始, 在 lo~hi 之间正弦变化。"""
     phase = 2.0 * math.pi * t / max(period, 0.1) - math.pi / 2.0
     return lo + (hi - lo) * (0.5 + 0.5 * math.sin(phase))
@@ -185,15 +214,8 @@ def top_fraction_mean(values, fraction: float = 0.30) -> float:
     return sum(vals[:k]) / k
 
 
-# 拖音评分候选: 当前只实验 en1, 作为同一 KWS 的第二路关键词。
+# 影子测量标签: 只记录 E_k/E_d, 不注册第二路 KWS, 也不参与亮度决策。
 UN_EXPERIMENT_CANDIDATE = "en1"
-
-
-def un_score_values(ed: float, ek: float, match: float):
-    """I=E_d/E_k, M=候选匹配概率, S=0.6I+0.4M。"""
-    i = clamp(ed / ek, 0.0, 1.0) if ek > 1e-9 else 0.0
-    m = clamp(match, 0.0, 1.0)
-    return i, m, 0.6 * i + 0.4 * m
 
 
 def blink_hz(level: float, lo: float = 1.0, hi: float = 8.0) -> float:
@@ -220,205 +242,62 @@ def decay_step(light: float, target: float, decay_per_tick: float,
     return clamp(decayed, 0.0, 100.0)
 
 
-class GateDetector:
-    """
-    只做“上升沿”检测, 不做任何时间不应期。
-    概率超过 threshold 触发一次, 回落到 rearm 以下后才允许下一次。
-    这样同一句 "长春" 不会每帧重复触发, 但用户连续说两次可以立刻响应。
-    """
+# ======================================================================
+# 单字关键词与时序拼装
+# ======================================================================
 
-    def __init__(self, threshold: float = 0.5, rearm: float = 0.28):
-        if rearm >= threshold:
-            raise ValueError("rearm 必须小于 threshold")
-        self.threshold = threshold
-        self.rearm = rearm
-        self.armed = True
+# 只注册单字。KWS 的 True 参数允许近音, 所以声调仍可能互相抢概率;
+# 判断段按字族(chang/ang/chun)拼装, 不依赖具体声调是否完全正确。
+#
+# 注意: am_3332_192_int8 的词表里没有 "chun4" (实测
+# "parse kws chun4 error!"), 但支持 "chun3"; 因此用 chun3 代替
+# 用户列出的 chun4, 仍然保持 8 个关键词。
+CHAR_KEYWORD_SPECS = (
+    ("chang1", "chang"),
+    ("chang2", "chang"),
+    ("chang4", "chang"),
+    ("chun1", "chun"),
+    ("chun2", "chun"),
+    ("chun3", "chun"),
+    ("ang1", "ang"),
+    ("ang2", "ang"),
+)
+UNSUPPORTED_CHAR_KEYWORDS = ("chun4",)
+CHAR_KEYWORDS = tuple(keyword for keyword, _family in CHAR_KEYWORD_SPECS)
+CHAR_FAMILY_OF = dict(CHAR_KEYWORD_SPECS)
+CHAR_FAMILY_ORDER = ("chang", "ang", "chun")
 
-    def feed(self, prob: float) -> bool:
-        if prob >= self.threshold:
-            if self.armed:
-                self.armed = False
-                return True
-            return False
-        if prob < self.rearm:
-            self.armed = True
-        return False
+# 额外注册一个正常连读的整词关键词。Maix-Speech 的 kws 支持用空格分隔的
+# 多音节拼音（例如 "xiao3 ai4 tong2 xue2"）；连续说“长春”时单字 KWS 有时
+# 只上报其中一个字，但整词 KWS 能直接给出“chang2 chun1”的概率。
+# 拖长“长～～春”仍然走下面的单字拼装路径。
+PHRASE_KEYWORD_SPECS = (
+    ("chang2 chun1", "phrase"),
+)
+PHRASE_KEYWORDS = tuple(keyword for keyword, _family in PHRASE_KEYWORD_SPECS)
+KWS_KEYWORDS = CHAR_KEYWORDS + PHRASE_KEYWORDS
+KWS_FAMILY_OF = dict(CHAR_FAMILY_OF)
+KWS_FAMILY_OF.update(dict(PHRASE_KEYWORD_SPECS))
+KWS_FAMILY_ORDER = CHAR_FAMILY_ORDER + ("phrase",)
+
+# 判断进程收到的事件: 时间戳、墙钟、关键词、字族、置信度、本次连续人声时长。
+# pre_voiced 由 DSP 子进程依据 RMS 实时累计，供“拖长的长”兜底判断。
+CharEvent = collections.namedtuple(
+    "CharEvent", "mono wall keyword family conf pre_voiced",
+    defaults=(0.0,))
 
 
 # ======================================================================
 # 音量 DSP (在子进程里运行, 避免被 nn.Speech 的 GIL 阻塞)
 # ======================================================================
 
-class VoiceEnhancer:
-    """
-    512 点 STFT 的轻量人声增强:
-
-    1. 频域高通: 削弱 80 Hz 以下的风噪/低频轰鸣。
-    2. 谱减: 慢速估计噪声幅度谱, 从当前帧减掉, 抑制环境白噪声。
-    3. 人声频带加权: 150~1200 Hz (元音/ang、en、un 鼻韵) 提升,
-       1200~3500 Hz 适度提升, 5 kHz 以上衰减。
-    4. 风噪检测: 120 Hz 以下能量占比过高时进一步压低低频。
-    5. 与语音模型联动: KWS 概率高或业务态时, 降低噪声门限并额外
-       提升人声频带; 此时冻结噪声估计, 避免把拖音当成噪声学进去。
-    6. 快/慢双包络: 快包络给亮度, 慢包络给闪烁频率。
-    """
-
-    def __init__(self, sample_rate: int = 16000, n_fft: int = 512):
-        import numpy as np
-
-        self.np = np
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.frame_seconds = n_fft / float(sample_rate)
-
-        self.window = np.hanning(n_fft).astype(np.float32)
-        self.window_gain = float(np.sqrt(np.mean(self.window * self.window)))
-        self.freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate).astype(np.float32)
-
-        w = np.ones_like(self.freqs, dtype=np.float32)
-        w[self.freqs < 80.0] = 0.03
-        w[(self.freqs >= 80.0) & (self.freqs < 150.0)] = 0.35
-        w[(self.freqs >= 150.0) & (self.freqs <= 1200.0)] = 1.60
-        w[(self.freqs > 1200.0) & (self.freqs <= 3500.0)] = 1.25
-        w[self.freqs > 5000.0] = 0.50
-        self.band_weight = w
-
-        self.noise_mag = None
-        self.noise_db = -60.0
-        self.env_fast = 0.0
-        self.env_slow = 0.0
-        self.wind = 0.0
-        self.peak_hist = collections.deque()
-
-    def process(self, frame, kws_prob: float, business: float):
-        np = self.np
-        frame = frame.astype(np.float32, copy=False)
-        frame = frame - float(frame.mean())
-
-        x = frame * self.window
-        spectrum = np.fft.rfft(x)
-        mag = np.abs(spectrum).astype(np.float32)
-        power = mag * mag
-        total_power = float(power.sum()) + 1e-12
-
-        frame_rms = float(np.sqrt(np.mean(frame * frame)) + 1e-9)
-        frame_db = 20.0 * math.log10(frame_rms + 1e-9)
-
-        low_ratio = float(power[self.freqs < 120.0].sum()) / total_power
-        voice_hint = (kws_prob > 0.15) or (business > 0.5)
-
-        if self.noise_mag is None:
-            self.noise_mag = np.maximum(mag * 0.25, 1e-6)
-            self.noise_db = frame_db - 6.0
-
-        # 安静时快速学习噪声; 有人声/业务时几乎冻结, 防止把拖音吃掉。
-        if (not voice_hint) and frame_db < self.noise_db + 8.0:
-            self.noise_mag = 0.98 * self.noise_mag + 0.02 * mag
-            self.noise_db = 0.98 * self.noise_db + 0.02 * frame_db
-        else:
-            capped = np.minimum(mag, self.noise_mag * 1.2)
-            self.noise_mag = 0.9995 * self.noise_mag + 0.0005 * capped
-
-        # 谱减
-        clean_mag = np.maximum(mag - 1.6 * self.noise_mag, 0.0)
-
-        # 风噪: 低频占比高时进一步压掉低频, 并记录一个平滑标志。
-        wind_now = 1.0 if (low_ratio > 0.62 and kws_prob < 0.15) else 0.0
-        self.wind = 0.90 * self.wind + 0.10 * wind_now
-        if self.wind > 0.30:
-            clean_mag[self.freqs < 180.0] *= 0.15
-
-        weight = self.band_weight
-        if voice_hint:
-            # 鼻韵/拖音主要能量在 150~1500 Hz, 语音模型在场时再抬一点。
-            weight = weight.copy()
-            band = (self.freqs >= 150.0) & (self.freqs <= 1500.0)
-            weight[band] *= 1.20
-        clean_mag *= weight
-
-        # 用原相位重建, 计算干净信号的 RMS。
-        ratio = clean_mag / (mag + 1e-9)
-        clean = np.fft.irfft(spectrum * ratio, n=self.n_fft)
-        rms = float(np.sqrt(np.mean(clean * clean))) / max(self.window_gain, 1e-6)
-
-        clean_db = 20.0 * math.log10(rms + 1e-9)
-        gate_db = self.noise_db + (3.0 if voice_hint else 6.0)
-        if clean_db < gate_db:
-            rms = 0.0
-        if self.wind > 0.60 and kws_prob < 0.10:
-            rms = 0.0
-
-        # 快包络: 20 ms attack / 150 ms release, 跟住音节和拖音。
-        dt = self.frame_seconds
-        attack_fast = 1.0 - math.exp(-dt / 0.020)
-        release_fast = 1.0 - math.exp(-dt / 0.150)
-        if rms > self.env_fast:
-            self.env_fast += attack_fast * (rms - self.env_fast)
-        else:
-            self.env_fast += release_fast * (rms - self.env_fast)
-
-        # 慢包络: 100 ms attack / 500 ms release, 给闪烁频率, 避免抖动。
-        attack_slow = 1.0 - math.exp(-dt / 0.100)
-        release_slow = 1.0 - math.exp(-dt / 0.500)
-        if rms > self.env_slow:
-            self.env_slow += attack_slow * (rms - self.env_slow)
-        else:
-            self.env_slow += release_slow * (rms - self.env_slow)
-
-        now = time.monotonic()
-        self.peak_hist.append((now, rms))
-        while self.peak_hist and now - self.peak_hist[0][0] > 1.5:
-            self.peak_hist.popleft()
-        peak = max((v for _, v in self.peak_hist), default=0.0)
-
-        return rms, self.env_fast, self.env_slow, peak, self.noise_db, self.wind
-
-
-def _tap_reader(fifo: str, stop_event, env_fast, env_slow, peak_rms,
-                noise_db, wind, kws_prob, business) -> None:
-    """子进程: 从 ALSA file 插件写出的 FIFO 读 PCM, 做降噪和音量包络。"""
-    try:
-        import numpy as np
-        enhancer = VoiceEnhancer()
-    except Exception as exc:  # noqa: BLE001
-        os.write(2, f"[dsp] init failed: {exc}\n".encode())
-        os._exit(2)
-
-    frame_bytes = enhancer.n_fft * 2
-    buf = bytearray()
-
-    while not stop_event.is_set() and os.getppid() != 1:
-        try:
-            with open(fifo, "rb", buffering=0) as f:
-                while not stop_event.is_set() and os.getppid() != 1:
-                    chunk = f.read(4096)
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    while len(buf) >= frame_bytes:
-                        raw = bytes(buf[:frame_bytes])
-                        del buf[:frame_bytes]
-                        frame = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                        rms, ef, es, peak, ndb, wnd = enhancer.process(
-                            frame, kws_prob.value, business.value)
-                        env_fast.value = ef
-                        env_slow.value = es
-                        peak_rms.value = peak
-                        noise_db.value = ndb
-                        wind.value = wnd
-        except FileNotFoundError:
-            time.sleep(0.2)
-        except Exception as exc:  # noqa: BLE001
-            os.write(2, f"[dsp] {exc}\n".encode())
-            time.sleep(0.2)
-
-    os._exit(0)
-
+# 实机只运行轻量 RMS 包络 (_tap_reader_simple)。旧 FFT/谱减增强器已移除:
+# KWS 推理本身占用大量 CPU/GIL, 再跑 FFT 会和识别抢资源, 拖音包络反而变差。
 
 class MicTap:
-    """管理音量 DSP 子进程; 必须在 nn.Speech 打开 pwm_mic 之前启动。"""
+    """管理音量 DSP 子进程; 必须在 nn.Speech 打开 surplife_mic 之前启动。"""
 
-    def __init__(self, fifo: str, stop_event):
+    def __init__(self, fifo: str, stop_event, voice_min: float = 0.01):
         self.fifo = fifo
         ctx = mp.get_context("fork")
         self.env_fast = ctx.Value("d", 0.0, lock=False)
@@ -428,9 +307,12 @@ class MicTap:
         self.noise_db = ctx.Value("d", -60.0, lock=False)
         self.wind = ctx.Value("d", 0.0, lock=False)
         self.kws_prob = ctx.Value("d", 0.0, lock=False)
-        self.un_prob = ctx.Value("d", 0.0, lock=False)
-        self.un_peak = ctx.Value("d", 0.0, lock=False)
         self.business = ctx.Value("d", 0.0, lock=False)
+        # 当前连续人声已经持续多久；静音 0.6s 后清零。
+        self.voice_duration = ctx.Value("d", 0.0, lock=False)
+        # 10s 肺活量彩蛋专用计时：静音 0.3s 后清零。
+        # 独立于 voice_duration，避免改变 v0.2.5 的 0.6s 长前导行为。
+        self.egg_voice_duration = ctx.Value("d", 0.0, lock=False)
 
         parent = os.path.dirname(fifo)
         if parent:
@@ -442,7 +324,8 @@ class MicTap:
             target=_tap_reader_simple,
             args=(fifo, stop_event, self.env_fast, self.env_slow,
                   self.peak_rms, self.peak_080, self.noise_db, self.wind,
-                  self.kws_prob, self.business),
+                  self.kws_prob, self.business, self.voice_duration,
+                  self.egg_voice_duration, voice_min),
             daemon=True,
         )
         self.proc.start()
@@ -527,8 +410,9 @@ def _clog(msg: str) -> None:
         pass
 
 
-def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
-                peak_080, un_peak, business, cfg) -> None:
+def _pwm_worker(stop_event, ready_event, gate_seq, egg_seq, egg_active,
+                env_fast, env_slow, peak_rms,
+                peak_080, business, cfg) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     # 这个进程在导入 maix 之前 fork, 只等父进程把 A18/A19 复用成 PWM6/PWM7。
@@ -566,8 +450,11 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
     un_ek = 0.0
     un_envs = collections.deque(maxlen=500)
     un_start = 0.0
-    un_score_low_since = 0.0
     last_gate_seq = gate_seq.value
+    # egg_seq 从 0 开始；不要用启动时的值，否则在 PWM 初始化完成前
+    # 已经触发的彩蛋会被漏掉。
+    last_egg_seq = 0
+    egg_start = 0.0
     linear_logged = False
     blink_phase = 0.0
     start = time.monotonic()
@@ -589,7 +476,57 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
             hz = cfg["blink_hz_min"]
             voice_active = False
 
-            if cfg["demo"]:
+            if not cfg["demo"] and egg_seq.value != last_egg_seq:
+                # 判断进程在连续人声满 10s 后递增 egg_seq。
+                # 这里立即覆盖当前业务灯效，开始不可打断的彩蛋。
+                last_egg_seq = egg_seq.value
+                state = "egg"
+                egg_start = now
+                egg_active.value = 1
+                business.value = 0.0
+                last_gate_seq = gate_seq.value
+                ref = cfg["min_ref"]
+                light_level = 0.0
+                hold_active = False
+                intro_active = False
+                hold_low_since = 0.0
+                blink_phase = 0.0
+                _clog(f"EGG start: flash={cfg['egg_flash_seconds']:.1f}s "
+                      f"cycle={cfg['egg_cycle_seconds']:.2f}s "
+                      f"off={cfg['egg_off_seconds']:.1f}s "
+                      f"bright={cfg['egg_bright']:.0f}%")
+
+            if state == "egg":
+                elapsed_egg = now - egg_start
+                flash_s = cfg["egg_flash_seconds"]
+                cycle_s = cfg["egg_cycle_seconds"]
+                off_s = cfg["egg_off_seconds"]
+                if elapsed_egg < flash_s:
+                    # 硬翻转：前半周期 100%，后半周期 0%。
+                    phase = elapsed_egg % cycle_s
+                    bright = (cfg["egg_bright"]
+                              if phase < cycle_s * 0.5 else 0.0)
+                elif elapsed_egg < flash_s + off_s:
+                    bright = 0.0
+                else:
+                    _clog(f"EGG end: elapsed={elapsed_egg:.2f}s, "
+                          f"return to standby breathing")
+                    state = "standby"
+                    egg_active.value = 0
+                    business.value = 0.0
+                    last_gate_seq = gate_seq.value
+                    ref = cfg["min_ref"]
+                    light_level = 0.0
+                    hold_active = False
+                    intro_active = False
+                    hold_low_since = 0.0
+                    # 从熄灭平滑接到呼吸低点 1%，不跳到 8%。
+                    breath_start = now
+                    bright = breathing_duty(now - breath_start,
+                                            cfg["standby_period"],
+                                            cfg["standby_min"],
+                                            cfg["standby_max"])
+            elif cfg["demo"]:
                 t = now - start
                 tick_s = cfg["decay_tick_ms"] / 1000.0
                 if 2.0 <= t < 7.0:
@@ -641,7 +578,6 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
                     un_ek = peak_080.value
                     un_envs.clear()
                     un_start = now
-                    un_score_low_since = 0.0
                     blink_phase = 0.0
                     business.value = 1.0
                     top = cfg["business_max"]
@@ -712,44 +648,6 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
                                   f"(from {intro_from:.0f}%, "
                                   f"target {intro_target:.0f}%)")
                     else:
-                        if (hold_active and cfg["un_score_enable"]
-                                and now - un_start >= cfg["un_score_min_seconds"]):
-                            ed_now = top_fraction_mean(un_envs, 0.30)
-                            i_now, m_now, s_now = un_score_values(
-                                ed_now, un_ek, un_peak.value)
-                            score_low = (s_now < cfg["un_score_release"]
-                                         or m_now < cfg["un_match_min"])
-                            if score_low:
-                                if un_score_low_since <= 0.0:
-                                    un_score_low_since = now
-                                elif (now - un_score_low_since
-                                      >= cfg["un_score_release_seconds"]):
-                                    hold_active = False
-                                    hold_low_since = 0.0
-                                    un_score_low_since = 0.0
-                                    business_start = now
-                                    linear_logged = False
-                                    ratio = (ed_now / un_ek
-                                             if un_ek > 1e-9 else 0.0)
-                                    _clog(f"UNSCORE release S={s_now:.3f} "
-                                          f"< {cfg['un_score_release']:.2f} "
-                                          f"or M={m_now:.3f} < "
-                                          f"{cfg['un_match_min']:.2f}; "
-                                          f"I={i_now:.3f} ek={un_ek:.4f} "
-                                          f"ed={ed_now:.4f} "
-                                          f"dur={now - un_start:.2f}s")
-                                    _clog(f"UNMEASURE cand="
-                                          f"{cfg['un_candidate']} "
-                                          f"ek={un_ek:.4f} ed={ed_now:.4f} "
-                                          f"ratio={ratio:.3f} "
-                                          f"I={i_now:.3f} M={m_now:.3f} "
-                                          f"S={s_now:.3f} "
-                                          f"dur={now - un_start:.2f}s "
-                                          f"frames={len(un_envs)}")
-                                    un_envs.clear()
-                            else:
-                                un_score_low_since = 0.0
-
                         if hold_active:
                             hold_peak = max(hold_peak, env)
                             hold_floor = max(cfg["voice_active_min"],
@@ -765,19 +663,15 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
                                     linear_logged = False
                                     ed = top_fraction_mean(un_envs, 0.30)
                                     ratio = ed / un_ek if un_ek > 1e-9 else 0.0
-                                    i_now, m_now, s_now = un_score_values(
-                                        ed, un_ek, un_peak.value)
                                     _clog(f"HOLD release, env={env:.4f} < "
                                           f"{hold_floor:.4f} "
                                           f"(peak={hold_peak:.4f}), start "
                                           f"{top:.0f}%->{end:.0f}% "
                                           f"{bezier_s + linear_s:.1f}s")
                                     _clog(f"UNMEASURE cand="
-                                          f"{cfg['un_candidate']} "
+                                          f"{UN_EXPERIMENT_CANDIDATE} "
                                           f"ek={un_ek:.4f} ed={ed:.4f} "
                                           f"ratio={ratio:.3f} "
-                                          f"I={i_now:.3f} M={m_now:.3f} "
-                                          f"S={s_now:.3f} "
                                           f"dur={now - un_start:.2f}s "
                                           f"frames={len(un_envs)}")
                                     un_envs.clear()
@@ -810,7 +704,7 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
                                 business.value = 0.0
                                 ref = cfg["min_ref"]
                                 light_level = 0.0
-                                # 呼吸在 16% 峰值处接上: 相位 pi/2 对应 hi。
+                                # 呼吸在 8% 峰值处接上: 相位 pi/2 对应 hi。
                                 breath_start = now - cfg["standby_period"] / 2.0
                                 bright = breathing_duty(
                                     now - breath_start, cfg["standby_period"],
@@ -833,13 +727,17 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
                 blink_phase -= math.floor(blink_phase)
             blink_on = blink_phase < 0.5
             in_business = (state == "business")
+            in_egg = (state == "egg")
 
             duty6 = bright
             if in_business and cfg["a18_blink"] and not blink_on:
                 duty6 = 0.0
 
             mode = cfg["pwm7_mode"]
-            if not in_business:
+            if in_egg:
+                # 彩蛋只动 A18；A19 保持熄灭。
+                duty7 = 0.0
+            elif not in_business:
                 duty7 = duty6 if mode == "mirror" else 0.0
             elif mode == "mirror":
                 duty7 = bright if (not cfg["a18_blink"] or blink_on) else 0.0
@@ -857,7 +755,10 @@ def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
 
             if now - last_log >= 1.0:
                 last_log = now
-                if in_business:
+                if state == "egg":
+                    _clog(f"EGG flash t={now - egg_start:.2f}s "
+                          f"A18={duty6:.0f}% A19={duty7:.0f}%")
+                elif in_business:
                     _clog(f"business level={level:.2f}/{level_slow:.2f} "
                           f"env={env_fast.value:.4f} light={light_level:.0f}% "
                           f"hold={int(hold_active)} intro={int(intro_active)} "
@@ -924,10 +825,38 @@ def build_config() -> dict:
     mode = os.environ.get("PWM7_MODE", "freq").strip().lower()
     if mode not in ("freq", "mirror", "square", "off"):
         mode = "freq"
-    gate_threshold = _env_float("VOICE_GATE_THRESHOLD", 0.5)
-    gate_rearm = _env_float("VOICE_GATE_REARM", 0.28)
-    if gate_rearm >= gate_threshold:
-        gate_rearm = gate_threshold * 0.5
+    gate_threshold = clamp(
+        _env_float("VOICE_GATE_THRESHOLD", 0.35), 0.0, 1.0)
+    phrase_threshold = clamp(
+        _env_float("VOICE_PHRASE_THRESHOLD", 0.30), 0.0, 1.0)
+    char_threshold = clamp(
+        _env_float("VOICE_CHAR_THRESHOLD", 0.10), 0.0, 1.0)
+    char_debounce = clamp(
+        _env_float("VOICE_CHAR_DEBOUNCE", 0.18), 0.0, 5.0)
+    phrase_debounce = clamp(
+        _env_float("VOICE_PHRASE_DEBOUNCE", 2.0), 0.0, 10.0)
+    seq_window = clamp(
+        _env_float("VOICE_SEQ_WINDOW", 0.0), 0.0, 3600.0)
+    gate_cooldown = clamp(
+        _env_float("VOICE_GATE_COOLDOWN", 1.0), 0.0, 10.0)
+    long_prefix_seconds = clamp(
+        _env_float("VOICE_LONG_PREFIX_SECONDS", 0.80), 0.0, 10.0)
+    long_prefix_rms = clamp(
+        _env_float("VOICE_LONG_PREFIX_RMS", 0.030), 0.0, 1.0)
+    long_prefix_min_conf = clamp(
+        _env_float("VOICE_LONG_PREFIX_MIN_CONF", 0.10), 0.0, 1.0)
+
+    # 10s 肺活量彩蛋。默认值就是最终定稿；环境变量只用于测试缩短。
+    egg_hold_seconds = clamp(
+        _env_float("VOICE_EGG_HOLD_SECONDS", 10.0), 1.0, 60.0)
+    egg_flash_seconds = clamp(
+        _env_float("VOICE_EGG_FLASH_SECONDS", 1.6), 0.2, 10.0)
+    egg_cycle_seconds = clamp(
+        _env_float("VOICE_EGG_CYCLE_SECONDS", 0.2), 0.05, 2.0)
+    egg_off_seconds = clamp(
+        _env_float("VOICE_EGG_OFF_SECONDS", 2.0), 0.0, 30.0)
+    egg_bright = clamp(_env_float("VOICE_EGG_BRIGHT", 100.0), 0.0, 100.0)
+    egg_test_after = max(0.0, _env_float("VOICE_EGG_TEST_AFTER", 0.0))
 
     light_threshold = clamp(_env_float("LIGHT_THRESHOLD", 35.0), 0.0, 99.0)
     business_min = max(_env_float("BUSINESS_MIN", 40.0), light_threshold + 1.0)
@@ -935,10 +864,27 @@ def build_config() -> dict:
 
     return {
         "model": os.environ.get("VOICE_AM_MODEL", "/root/models/am_3332_192_int8.mud"),
-        "keyword_pinyin": os.environ.get("VOICE_KEYWORD_PINYIN", "chang2 chun1"),
+        "kws_keywords": KWS_KEYWORDS,
+        "char_keywords": CHAR_KEYWORDS,
+        "phrase_keywords": PHRASE_KEYWORDS,
+        "char_threshold": char_threshold,
+        "char_debounce": char_debounce,
+        "phrase_debounce": phrase_debounce,
         "gate_threshold": gate_threshold,
-        "gate_rearm": gate_rearm,
+        "phrase_threshold": phrase_threshold,
+        "seq_window": seq_window,
+        "gate_cooldown": gate_cooldown,
+        "long_prefix_seconds": long_prefix_seconds,
+        "long_prefix_rms": long_prefix_rms,
+        "long_prefix_min_conf": long_prefix_min_conf,
+        "egg_hold_seconds": egg_hold_seconds,
+        "egg_flash_seconds": egg_flash_seconds,
+        "egg_cycle_seconds": egg_cycle_seconds,
+        "egg_off_seconds": egg_off_seconds,
+        "egg_bright": egg_bright,
+        "egg_test_after": egg_test_after,
         "alsa_device": os.environ.get("VOICE_ALSA_DEVICE", "surplife_mic"),
+        "input_wav": os.environ.get("VOICE_INPUT_WAV", "").strip(),
         "fifo": os.environ.get("VOICE_TAP_FIFO", "/root/surplife/run/surplife_mic.pcm"),
         "pwm6_path": os.environ.get("PWM6_PATH", "/sys/class/pwm/pwmchip4/pwm2"),
         "pwm7_path": os.environ.get("PWM7_PATH", "/sys/class/pwm/pwmchip4/pwm3"),
@@ -949,19 +895,19 @@ def build_config() -> dict:
         "blink_hz_min": _env_float("BLINK_HZ_MIN", 1.0),
         "blink_hz_max": _env_float("BLINK_HZ_MAX", 8.0),
         "blink_invert": _env_bool("BLINK_INVERT", False),
-        "standby_min": _env_float("STANDBY_MIN", 2.0),
-        "standby_max": _env_float("STANDBY_MAX", 16.0),
+        "standby_min": _env_float("STANDBY_MIN", 1.0),
+        "standby_max": _env_float("STANDBY_MAX", 8.0),
         "standby_period": _env_float("STANDBY_PERIOD", 4.0),
         "business_min": business_min,
         "business_max": business_max,
         "business_intro_seconds": clamp(
-            _env_float("BUSINESS_INTRO_SECONDS", 0.1), 0.0, 10.0),
+            _env_float("BUSINESS_INTRO_SECONDS", 0.03), 0.0, 10.0),
         "business_intro_target": clamp(
             _env_float("BUSINESS_INTRO_TARGET", 100.0), 0.0, 100.0),
         "business_bezier_seconds": clamp(
             _env_float("BUSINESS_BEZIER_SECONDS", 1.3), 0.05, 60.0),
         "business_linear_seconds": clamp(
-            _env_float("BUSINESS_LINEAR_SECONDS", 1.0), 0.05, 60.0),
+            _env_float("BUSINESS_LINEAR_SECONDS", 1.2), 0.05, 60.0),
         "business_hold_ratio": clamp(
             _env_float("BUSINESS_HOLD_RATIO", 0.15), 0.01, 0.95),
         "business_hold_release_seconds": clamp(
@@ -976,18 +922,6 @@ def build_config() -> dict:
         "dry_run": _env_bool("PWM_DRY_RUN", False),
         "demo": _env_bool("PWM_DEMO", False),
         "kws_debug": _env_bool("VOICE_KWS_DEBUG", False),
-        # 拖音评分: 候选 en1 走 KWS 第二路; 评分低时提前退出 100%。
-        "un_candidate": (os.environ.get("UN_CANDIDATE")
-                         or UN_EXPERIMENT_CANDIDATE).strip(),
-        "un_score_enable": _env_bool("UN_SCORE_ENABLE", True),
-        "un_score_min_seconds": clamp(
-            _env_float("UN_SCORE_MIN_SECONDS", 0.40), 0.0, 10.0),
-        "un_score_release": clamp(
-            _env_float("UN_SCORE_RELEASE", 0.45), 0.0, 1.0),
-        "un_match_min": clamp(
-            _env_float("UN_MATCH_MIN", 0.03), 0.0, 1.0),
-        "un_score_release_seconds": clamp(
-            _env_float("UN_SCORE_RELEASE_SECONDS", 0.12), 0.0, 10.0),
         # 仅用于无真人说话时的端到端诊断: N 秒后注入一次门控事件。
         "test_gate_after": _env_float("PWM_TEST_GATE_AFTER", 0.0),
     }
@@ -995,12 +929,17 @@ def build_config() -> dict:
 
 
 def _tap_reader_simple(fifo, stop_event, env_fast, env_slow, peak_rms,
-                       peak_080, noise_db, wind, kws_prob, business):
+                       peak_080, noise_db, wind, kws_prob, business,
+                       voice_duration, egg_voice_duration, voice_min):
     """轻量音量包络: 只算 RMS, 不做 FFT/谱减, 避免和 KWS 抢 CPU。"""
     import array
     peak_hist = collections.deque()
     envf = 0.0
     envs = 0.0
+    voiced_start = None
+    voiced_last = 0.0
+    egg_voiced_start = None
+    egg_voiced_last = 0.0
     while not stop_event.is_set() and os.getppid() != 1:
         try:
             with open(fifo, "rb", buffering=0) as f:
@@ -1027,6 +966,28 @@ def _tap_reader_simple(fifo, stop_event, env_fast, env_slow, peak_rms,
                     else:
                         envs += r_slow * (rms - envs)
                     now = time.monotonic()
+                    if rms >= voice_min:
+                        if voiced_start is None:
+                            voiced_start = now
+                        voiced_last = now
+                        voice_duration.value = now - voiced_start
+                    elif (voiced_start is not None
+                          and now - voiced_last > 0.60):
+                        # 留 0.6s 余量给 KWS 回调/端点判断，避免刚好在
+                        # 尾音结束后把拖音前导清零。
+                        voiced_start = None
+                        voice_duration.value = 0.0
+                    # 彩蛋计时用更严格的 0.3s 静音清零；不改变上面的
+                    # v0.2.5 长前导计时。
+                    if rms >= voice_min:
+                        if egg_voiced_start is None:
+                            egg_voiced_start = now
+                        egg_voiced_last = now
+                        egg_voice_duration.value = now - egg_voiced_start
+                    elif (egg_voiced_start is not None
+                          and now - egg_voiced_last > 0.30):
+                        egg_voiced_start = None
+                        egg_voice_duration.value = 0.0
                     peak_hist.append((now, rms))
                     while peak_hist and now - peak_hist[0][0] > 1.5:
                         peak_hist.popleft()
@@ -1046,6 +1007,277 @@ def _tap_reader_simple(fifo, stop_event, env_fast, env_slow, peak_rms,
             time.sleep(0.2)
     os._exit(0)
 
+
+def _judgment_worker(event_conn, stop_event, gate_seq, egg_seq, egg_active,
+                     egg_voice_duration, cfg) -> None:
+    """判断进程: 整词优先，单字序列兜底；同时负责 10s 肺活量彩蛋。
+
+    正常的 v0.2.5 门控逻辑保持不变:
+      - 整词 phrase 概率 >= phrase 门限: 直接开门；
+      - 记录 chang，收到 chun 后按两字最大置信度开门；
+      - 只有 chun 时，若长前导达到 VOICE_LONG_PREFIX_SECONDS，按低门限开门。
+
+    彩蛋只叠加一个连续人声计时器:
+      - DSP 用 RMS >= 0.03 计时，静音 0.3s 清零（独立于 v0.2.5 的
+        0.6s 长前导计时）；
+      - phrase / chang+chun / changchun-long 任一有效事件后，当前连续
+        人声累计到 10s 即触发；
+      - 触发后由 PWM 进程执行 8 次硬翻转、2s 熄灭、再回呼吸；
+      - 彩蛋期间丢弃所有新事件，不排队；
+      - 彩蛋结束后，旧的“春”后续事件继续丢弃，必须重新说完整的
+        “长春”（新的 chang 或 phrase 才能重新武装）。
+    """
+    window = cfg["seq_window"]
+    window_text = "不限" if window <= 0 else f"{window:.1f}s"
+    log.info("判断进程启动: 门限=%.2f window=%s cooldown=%.2fs",
+             cfg["gate_threshold"], window_text, cfg["gate_cooldown"])
+    log.info("彩蛋: hold=%.2fs 连续人声, 静音=0.30s, flash=%.2fs "
+             "(cycle=%.2fs), off=%.2fs, bright=%.0f%%",
+             cfg["egg_hold_seconds"], cfg["egg_flash_seconds"],
+             cfg["egg_cycle_seconds"], cfg["egg_off_seconds"],
+             cfg["egg_bright"])
+
+    last_chang = None
+    last_gate = -1.0e9
+
+    # 彩蛋状态
+    egg_armed = False
+    egg_armed_at = 0.0
+    egg_base = 0.0
+    last_egg_active = 0
+    post_egg_wait_new = False
+    ignore_before = 0.0
+    loop_start = time.monotonic()
+    egg_test_sent = False
+
+    def arm_egg() -> None:
+        nonlocal egg_armed, egg_armed_at
+        egg_armed = True
+        egg_armed_at = time.monotonic()
+
+    def maybe_trigger_egg(now: float) -> bool:
+        nonlocal egg_armed
+        if egg_active.value or post_egg_wait_new or not egg_armed:
+            return False
+        timer = float(egg_voice_duration.value)
+        if timer <= 0.05:
+            if now - egg_armed_at > 0.10:
+                egg_armed = False
+            return False
+        if timer - egg_base < cfg["egg_hold_seconds"]:
+            return False
+        egg_seq.value = egg_seq.value + 1
+        egg_active.value = 1
+        egg_armed = False
+        log.info("EGG TRIGGER: continuous=%.2fs base=%.2fs hold=%.1fs",
+                 timer, egg_base, cfg["egg_hold_seconds"])
+        return True
+
+    try:
+        while not stop_event.is_set():
+            now = time.monotonic()
+            timer = float(egg_voice_duration.value)
+
+            active = egg_active.value
+            if active and not last_egg_active:
+                last_egg_active = 1
+                last_chang = None
+                egg_armed = False
+                post_egg_wait_new = False
+                log.info("EGG running: voice triggers locked")
+            elif not active and last_egg_active:
+                last_egg_active = 0
+                post_egg_wait_new = True
+                last_chang = None
+                egg_armed = False
+                last_gate = -1.0e9
+                egg_base = 0.0
+                ignore_before = now
+                log.info("EGG end: old 春 ignored until new 长春")
+
+            if timer <= 0.05:
+                # 给事件/DSP 一点点时钟对齐余量；事件后 0.1s 仍无连续
+                # 人声才真正解除武装，避免刚 arm 就被下一轮清零。
+                if egg_armed and now - egg_armed_at > 0.10:
+                    log.info("EGG disarm: silence reset")
+                    egg_armed = False
+                egg_base = 0.0
+                if post_egg_wait_new:
+                    post_egg_wait_new = False
+                    log.info("EGG ready: silence reset")
+            elif timer < egg_base:
+                # DSP 计时器在 0.3s 静音后归零，之后重新起声。
+                egg_base = 0.0
+
+            if (cfg["egg_test_after"] > 0 and not egg_test_sent
+                    and now - loop_start >= cfg["egg_test_after"]):
+                egg_test_sent = True
+                egg_seq.value = egg_seq.value + 1
+                egg_active.value = 1
+                egg_armed = False
+                log.info("EGG TEST trigger")
+
+            if maybe_trigger_egg(now):
+                # 本 tick 不再处理识别事件；下一轮进入锁定期。
+                continue
+
+            try:
+                if not event_conn.poll(0.02):
+                    if (last_chang is not None and window > 0
+                            and time.monotonic() - last_chang.mono > window):
+                        last_chang = None
+                    continue
+                event = event_conn.recv()
+            except (EOFError, OSError):
+                break
+            except KeyboardInterrupt:
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.exception("判断进程读取事件失败: %s", exc)
+                break
+
+            # 彩蛋锁定期：任何识别结果都丢弃，不排队。
+            if egg_active.value:
+                continue
+
+            # 如果彩蛋在 poll 阻塞期间刚好结束，这里补一次结束转换；
+            # 否则这个尾音事件可能在 post_egg_wait_new 置位前被处理。
+            if last_egg_active:
+                last_egg_active = 0
+                post_egg_wait_new = True
+                last_chang = None
+                egg_armed = False
+                last_gate = -1.0e9
+                egg_base = 0.0
+                ignore_before = time.monotonic()
+                log.info("EGG end: old 春 ignored until new 长春")
+
+            # 彩蛋结束时的旧事件（时间戳早于结束时刻）也丢弃。
+            if event.mono < ignore_before:
+                log.info("EGG drop stale event family=%s keyword=%s",
+                         event.family, event.keyword)
+                continue
+
+            # 彩蛋结束后的旧“春”不能重新开门；必须有新的 chang/phrase。
+            if post_egg_wait_new:
+                if event.family in ("chang", "phrase"):
+                    post_egg_wait_new = False
+                    egg_base = float(egg_voice_duration.value)
+                    log.info("EGG new utterance via %s base=%.2fs",
+                             event.family, egg_base)
+                else:
+                    log.info("EGG HOLD old event family=%s keyword=%s; "
+                             "need new 长春", event.family, event.keyword)
+                    continue
+
+            # 整词 KWS: 正常连读“长春”时单字可能只命中一个，整词仍能直接
+            # 给出 chang2 chun1 的高概率；达到门限就直接开门。
+            if event.family == "phrase":
+                now = time.monotonic()
+                if event.conf >= cfg["phrase_threshold"]:
+                    arm_egg()
+                    if now - last_gate >= cfg["gate_cooldown"]:
+                        gate_seq.value = gate_seq.value + 1
+                        last_gate = now
+                        log.info("SEQ GATE branch=changchun-phrase score=%.3f "
+                                 "gate=%.2f keyword=%s",
+                                 event.conf, cfg["phrase_threshold"], event.keyword)
+                        log.info("GATE[changchun-phrase]: changchun=%.3f",
+                                 event.conf)
+                    else:
+                        log.info("SEQ HOLD phrase=%s p=%.3f "
+                                 "reason=cooldown(%.2fs)",
+                                 event.keyword, event.conf,
+                                 now - last_gate)
+                    # 整词已经是一句完整命令，清掉可能残留的单字状态。
+                    last_chang = None
+                else:
+                    log.info("SEQ HOLD phrase=%s p=%.3f < gate=%.2f",
+                             event.keyword, event.conf,
+                             cfg["phrase_threshold"])
+                continue
+
+            if event.family == "chang":
+                last_chang = event
+                continue
+
+            # ang 仍由 KWS 输出到 CHAR 日志, 但门控不再依赖它。
+            if event.family != "chun":
+                continue
+
+            if last_chang is None:
+                pre = float(getattr(event, "pre_voiced", 0.0))
+                # 拖长“长～～春”时 KWS 往往只报 chun，甚至整词也失配。
+                # 如果本次连续人声在 chun 之前已经持续了足够久，把它当作
+                # 拖长的“长”前导；单独短促的“春”达不到这个时长。
+                if (pre >= cfg["long_prefix_seconds"]
+                        and event.conf >= cfg["long_prefix_min_conf"]):
+                    arm_egg()
+                    now = time.monotonic()
+                    if now - last_gate >= cfg["gate_cooldown"]:
+                        gate_seq.value = gate_seq.value + 1
+                        last_gate = now
+                        log.info("SEQ GATE branch=changchun-long score=%.3f "
+                                 "gate=%.2f pre=%.2fs keyword=%s",
+                                 event.conf, cfg["long_prefix_min_conf"], pre,
+                                 event.keyword)
+                        log.info("GATE[changchun-long]: changchun=%.3f",
+                                 event.conf)
+                    else:
+                        log.info("SEQ HOLD chun=%s p=%.3f pre=%.2fs "
+                                 "reason=cooldown(%.2fs)",
+                                 event.keyword, event.conf, pre,
+                                 now - last_gate)
+                else:
+                    log.info("SEQ HOLD chun=%s p=%.3f reason=no-chang pre=%.2fs",
+                             event.keyword, event.conf, pre)
+                continue
+
+            gap = event.mono - last_chang.mono
+            if gap < 0:
+                log.info("SEQ HOLD chun=%s p=%.3f reason=order",
+                         event.keyword, event.conf)
+                continue
+            if window > 0 and gap > window:
+                log.info("SEQ HOLD chun=%s p=%.3f reason=timeout gap=%.2fs",
+                         event.keyword, event.conf, gap)
+                last_chang = None
+                continue
+
+            # 长拖音时 KWS 往往只有其中一个字概率高; 用 max 比平均更稳,
+            # 同时仍要求 chang 和 chun 两个字都真的出现过。
+            score = max(last_chang.conf, event.conf)
+            detail = (f"{last_chang.keyword}={last_chang.conf:.3f}@+0.000s "
+                      f"{event.keyword}={event.conf:.3f}@+{gap:.3f}s")
+            now = time.monotonic()
+            if score >= cfg["gate_threshold"]:
+                arm_egg()
+                if now - last_gate >= cfg["gate_cooldown"]:
+                    gate_seq.value = gate_seq.value + 1
+                    last_gate = now
+                    log.info("SEQ GATE branch=changchun score=%.3f (max) "
+                             "gate=%.2f gap=%.2fs %s",
+                             score, cfg["gate_threshold"], gap, detail)
+                    # 保持旧日志兼容格式, 供宿主机记录器抓取。
+                    log.info("GATE[%s+%s]: %s=%.3f, %s=%.3f",
+                             last_chang.keyword, event.keyword,
+                             last_chang.keyword, last_chang.conf,
+                             event.keyword, event.conf)
+                else:
+                    log.info("SEQ HOLD score=%.3f reason=cooldown(%.2fs) %s",
+                             score, now - last_gate, detail)
+            else:
+                log.info("SEQ HOLD score=%.3f < gate=%.2f %s",
+                         score, cfg["gate_threshold"], detail)
+
+            # 一句完整的话只消费一次; 避免同一个 chun 反复触发。
+            last_chang = None
+    finally:
+        try:
+            event_conn.close()
+        except OSError:
+            pass
+        log.info("判断进程退出")
 
 def main() -> int:
     logging.basicConfig(
@@ -1074,35 +1306,61 @@ def main() -> int:
              bezier_s * (1.0 - BUSINESS_BEZIER_SPLIT),
              cfg["light_threshold"], cfg["standby_max"],
              cfg["business_linear_seconds"], cfg["standby_max"])
-    log.info("un score %s: cand=%s via KWS #2, I=ed/ek, M=match peak, "
-             "S=0.6I+0.4M; release if S<%.2f or M<%.2f after %.2fs "
-             "(debounce %.2fs)",
-             "ENABLED" if cfg["un_score_enable"] else "SHADOW",
-             cfg["un_candidate"], cfg["un_score_release"],
-             cfg["un_match_min"], cfg["un_score_min_seconds"],
-             cfg["un_score_release_seconds"])
+    log.info("un shadow only: cand=%s, ek=0.8s max pre-gate, "
+             "ed=top30%% post-gate; no KWS #2, no score gate; "
+             "hold 100%% only while env >= %.0f%% peak",
+             UN_EXPERIMENT_CANDIDATE,
+             cfg["business_hold_ratio"] * 100)
 
     ctx = mp.get_context("fork")
     stop_event = ctx.Event()
     gate_seq = ctx.Value("i", 0, lock=False)
+    egg_seq = ctx.Value("i", 0, lock=False)
+    egg_active = ctx.Value("i", 0, lock=False)
+
+    log.info("egg config: hold=%.1fs flash=%.1fs cycle=%.2fs off=%.1fs "
+             "bright=%.0f%% A19=0",
+             cfg["egg_hold_seconds"], cfg["egg_flash_seconds"],
+             cfg["egg_cycle_seconds"], cfg["egg_off_seconds"],
+             cfg["egg_bright"])
 
     # 1) 先 fork 音量 DSP, 此时还没有导入 maix, 避免把多媒体状态带进子进程。
-    tap = MicTap(cfg["fifo"], stop_event)
+    tap = MicTap(cfg["fifo"], stop_event, cfg["long_prefix_rms"])
 
     # 2) 再 fork PWM 子进程; 它只写 sysfs, 等父进程设置好 A18/A19 复用后再启动。
     #    这样它不会继承 maix/多媒体状态, 在 128 MB 内存的板子上更省。
     pwm_ready = ctx.Event()
     pwm_proc = ctx.Process(
         target=_pwm_worker,
-        args=(stop_event, pwm_ready, gate_seq, tap.env_fast, tap.env_slow,
-              tap.peak_rms, tap.peak_080, tap.un_peak, tap.business, cfg),
+        args=(stop_event, pwm_ready, gate_seq, egg_seq, egg_active,
+              tap.env_fast, tap.env_slow, tap.peak_rms, tap.peak_080,
+              tap.business, cfg),
         daemon=True,
     )
     pwm_proc.start()
 
-    speech = None
+    # 3) 判断进程也必须在导入 maix 之前 fork。识别段从 KWS 回调通过 Pipe
+    #    直接发送单字事件, 不依赖 mp.Queue 的 feeder 线程, 避免被 GIL 拖住。
+    event_recv, event_send = ctx.Pipe(duplex=False)
+    judgment_proc = ctx.Process(
+        target=_judgment_worker,
+        args=(event_recv, stop_event, gate_seq, egg_seq, egg_active,
+              tap.egg_voice_duration, cfg),
+        daemon=True,
+    )
+    judgment_proc.start()
+    event_recv.close()
+
     try:
-        # 3) 父进程导入 maix, 设置 A18/A19 的 PWM 复用功能。
+        # start/stop 脚本用 SIGTERM 停止服务; 只设置停止事件, 不在这里抛异常
+        # (KWS 回调里抛 KeyboardInterrupt 会绕过主循环的 finally)。
+        # speech.run() 很快返回, 主循环随后看到 stop_event 并正常清理子进程。
+        def _on_term(signum, frame):
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, _on_term)
+
+        # 4) 父进程导入 maix, 设置 A18/A19 的 PWM 复用功能。
         from maix import app, err, nn, pinmap
 
         if _env_bool("SKIP_PINMAP", False):
@@ -1117,72 +1375,134 @@ def main() -> int:
         pwm_ready.set()
 
         speech = nn.Speech(cfg["model"])
-        ret = speech.init(nn.SpeechDevice.DEVICE_MIC, cfg["alsa_device"])
+        if cfg["input_wav"]:
+            log.info("离线 WAV 调试输入: %s", cfg["input_wav"])
+            ret = speech.init(nn.SpeechDevice.DEVICE_WAV, cfg["input_wav"])
+        else:
+            ret = speech.init(nn.SpeechDevice.DEVICE_MIC,
+                              cfg["alsa_device"])
         if ret != err.Err.ERR_NONE:
-            log.error("打开 ALSA 设备 %s 失败: %s", cfg["alsa_device"], ret)
+            log.error("打开音频输入失败 (%s / %s): %s",
+                      cfg["alsa_device"], cfg["input_wav"] or "mic", ret)
             return 1
 
-        gate = GateDetector(cfg["gate_threshold"], cfg["gate_rearm"])
-        last_prob_log = 0.0
-        un_peak = 0.0
+        last_emit = {family: -1.0e9 for family in KWS_FAMILY_ORDER}
+        last_char_mono = None
+        last_debug_log = 0.0
+        send_errors = 0
+        last_egg_active = 0
 
         def callback(data, length):
-            nonlocal last_prob_log, un_peak
+            nonlocal last_char_mono, last_debug_log, send_errors, last_egg_active
             if length < 1:
                 return
-            try:
-                prob = float(data[0])
-            except (TypeError, ValueError):
+            # 彩蛋锁定期内，识别回调不向判断进程发送任何事件。
+            if egg_active.value:
+                last_egg_active = 1
                 return
-            un_prob = 0.0
-            if len(data) > 1:
+            if last_egg_active:
+                # 彩蛋结束时清掉去抖，保证新“长春”立刻可以响应。
+                last_egg_active = 0
+                last_char_mono = None
+                for family in KWS_FAMILY_ORDER:
+                    last_emit[family] = -1.0e9
+                log.info("EGG ready: KWS debounce reset")
+            now = time.monotonic()
+            best = {}
+            top_prob = 0.0
+            top_keyword = "-"
+            for idx, keyword in enumerate(cfg["kws_keywords"]):
+                if idx >= length:
+                    break
                 try:
-                    un_prob = float(data[1])
+                    prob = float(data[idx])
                 except (TypeError, ValueError):
-                    un_prob = 0.0
-            tap.kws_prob.value = prob
-            tap.un_prob.value = un_prob
-            if cfg["kws_debug"]:
-                now = time.monotonic()
-                if ((prob >= 0.02 or un_prob >= 0.02)
-                        and now - last_prob_log >= 0.2):
-                    log.info("KWS p=%.3f %s=%.3f",
-                             prob, cfg["un_candidate"], un_prob)
-                    last_prob_log = now
-            if gate.feed(prob):
-                un_peak = 0.0
-                tap.un_peak.value = 0.0
-                gate_seq.value = gate_seq.value + 1
-                log.info("GATE: '%s' p=%.3f", cfg["keyword_pinyin"], prob)
-            if un_prob > un_peak:
-                un_peak = un_prob
-                tap.un_peak.value = un_peak
+                    continue
+                if prob > top_prob:
+                    top_prob = prob
+                    top_keyword = keyword
+                family = KWS_FAMILY_OF.get(keyword)
+                if family is None:
+                    continue
+                current = best.get(family)
+                if current is None or prob > current[0]:
+                    best[family] = (prob, keyword)
 
-        speech.kws([cfg["keyword_pinyin"], cfg["un_candidate"]],
-                   [0.1, 0.1], callback, True)
-        log.info("监听中: %s + %s (门限 %.2f, 回武装 %.2f, 无时间不应期)",
-                 cfg["keyword_pinyin"], cfg["un_candidate"],
-                 cfg["gate_threshold"], cfg["gate_rearm"])
+            tap.kws_prob.value = top_prob
+            if (cfg["kws_debug"] and top_prob >= 0.02
+                    and now - last_debug_log >= 0.5):
+                last_debug_log = now
+                log.info("KWS top=%s p=%.3f", top_keyword, top_prob)
+
+            for family in KWS_FAMILY_ORDER:
+                item = best.get(family)
+                if item is None:
+                    continue
+                prob, keyword = item
+                if prob < cfg["char_threshold"]:
+                    continue
+                debounce = (cfg["phrase_debounce"] if family == "phrase"
+                            else cfg["char_debounce"])
+                if now - last_emit[family] < debounce:
+                    continue
+                last_emit[family] = now
+                dt = 0.0 if last_char_mono is None else now - last_char_mono
+                last_char_mono = now
+                wall = time.strftime("%H:%M:%S")
+                pre_voiced = float(tap.voice_duration.value)
+                if family == "phrase":
+                    log.info("PHRASE %-12s p=%.3f t=%s mono=%.3f dt=%+.3f "
+                             "pre=%.2fs",
+                             keyword, prob, wall, now, dt, pre_voiced)
+                else:
+                    log.info("CHAR %-6s p=%.3f t=%s mono=%.3f dt=%+.3f "
+                             "pre=%.2fs",
+                             keyword, prob, wall, now, dt, pre_voiced)
+                event = CharEvent(now, wall, keyword, family, prob, pre_voiced)
+                try:
+                    event_send.send(event)
+                except (BrokenPipeError, EOFError, OSError) as exc:
+                    send_errors += 1
+                    if send_errors <= 3:
+                        log.error("关键词事件发送到判断进程失败: %s", exc)
+                    return
+
+        speech.kws(list(cfg["kws_keywords"]),
+                   [0.1] * len(cfg["kws_keywords"]), callback, True)
+        log.info("识别单字: %s (单字门限 %.2f, 去抖 %.2fs)",
+                 " ".join(cfg["char_keywords"]),
+                 cfg["char_threshold"], cfg["char_debounce"])
+        log.info("识别整词: %s (整词门限 %.2f, 去抖 %.2fs)",
+                 " | ".join(cfg["phrase_keywords"]),
+                 cfg["phrase_threshold"], cfg["phrase_debounce"])
+        log.info("模型词表不支持: %s; 使用 chun3 覆盖第三声，第四声缺失",
+                 "/".join(UNSUPPORTED_CHAR_KEYWORDS))
+        window_text = ("不限" if cfg["seq_window"] <= 0
+                       else f"{cfg['seq_window']:.1f}s")
+        log.info("时序判断: chang -> chun (window=%s, 分数=max(两字置信度)); "
+                 "门限=%.2f, cooldown=%.2fs, 长前导=%.2fs@rms>=%.3f "
+                 "低置信门限=%.2f",
+                 window_text, cfg["gate_threshold"], cfg["gate_cooldown"],
+                 cfg["long_prefix_seconds"], cfg["long_prefix_rms"],
+                 cfg["long_prefix_min_conf"])
 
         loop_start = time.monotonic()
         test_gate_sent = False
-        while not app.need_exit():
+        while not app.need_exit() and not stop_event.is_set():
             if not pwm_proc.is_alive():
                 log.error("PWM 子进程退出")
                 break
             if not tap.proc.is_alive():
                 log.error("音量 DSP 子进程退出")
                 break
+            if not judgment_proc.is_alive():
+                log.error("判断进程退出")
+                break
             if (cfg["test_gate_after"] > 0 and not test_gate_sent
                     and time.monotonic() - loop_start >= cfg["test_gate_after"]):
                 gate_seq.value = gate_seq.value + 1
-                un_peak = 0.0
-                tap.un_peak.value = 0.0
                 test_gate_sent = True
                 log.info("TEST GATE: 已注入一次门控事件")
-            if cfg["kws_debug"] and time.monotonic() - last_prob_log >= 2.0:
-                log.info("KWS idle p=%.3f", tap.kws_prob.value)
-                last_prob_log = time.monotonic()
             if speech.run(1) < 1:
                 log.warning("音频输入结束")
                 break
@@ -1190,6 +1510,15 @@ def main() -> int:
         log.info("收到 Ctrl+C")
     finally:
         stop_event.set()
+        try:
+            event_send.close()
+        except OSError:
+            pass
+        if judgment_proc.is_alive():
+            judgment_proc.join(2.0)
+            if judgment_proc.is_alive():
+                judgment_proc.terminate()
+                judgment_proc.join(1.0)
         if pwm_proc.is_alive():
             pwm_proc.join(2.0)
             if pwm_proc.is_alive():
