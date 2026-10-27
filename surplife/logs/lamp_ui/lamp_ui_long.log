@@ -1,0 +1,2 @@
+-- [I] [Maix Comm Protocol] auto set pinmap A16 to UART0_TX for uart0
+lamp_ui prepare: 1366 ms

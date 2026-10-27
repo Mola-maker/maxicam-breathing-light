@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Runtime / hardware artifacts
+*.pcm
+*.pid
+*.lock
+*.sock
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# Models and binary blobs
+models/
+*.mud
+*.cvimodel
+*.gguf
+*.onnx
+
+# Dependencies kept out of the public snapshot
+lib/
+wheels/
+
+# Local editor / OS files
+.DS_Store
+*.swp
+*~

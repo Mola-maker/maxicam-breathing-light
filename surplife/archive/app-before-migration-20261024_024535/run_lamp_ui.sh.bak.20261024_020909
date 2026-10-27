@@ -1,0 +1,21 @@
+#!/bin/sh
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+PIDFILE=/root/surplife/pwm.pid
+
+WAS_RUNNING=0
+if [ -f "$PIDFILE" ]; then
+    PID="$(cat "$PIDFILE" 2>/dev/null)"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        WAS_RUNNING=1
+        "$APP_DIR/stop_voice_pwm.sh" >/dev/null 2>&1
+    fi
+fi
+
+cd "$APP_DIR" || exit 1
+python3 lamp_ui.py "$@"
+RC=$?
+
+if [ "$WAS_RUNNING" = "1" ]; then
+    "$APP_DIR/start_voice_pwm.sh" >/dev/null 2>&1
+fi
+exit $RC

@@ -1,0 +1,7 @@
+-- [I] [Maix Comm Protocol] auto set pinmap A16 to UART0_TX for uart0
+lamp_ui prepare: 1551 ms
+/tmp/lamp_ui_bench.png  render 70.3 ms
+/tmp/lamp_ui_tune.png  render 45.1 ms
+/tmp/lamp_ui_modal.png  render 10.4 ms
+-- [I] [Maix Comm Protocol] auto set pinmap A17 to UART0_RX for uart0
+-- [I] [Maix Comm Protocol] listening on uart port: uart0(/dev/ttyS0)

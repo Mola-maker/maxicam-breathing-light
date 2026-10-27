@@ -1,0 +1,2353 @@
+#!/usr/bin/env python3
+"""
+MaixCAM Pro 灯效测试 UI (640x480 touch bench)
+
+默认启动本地实时 KWS 子进程（live_kws.py，复用 voice_pwm.py 的 Maix-Speech
+麦克风链），检测到“长春”后，用实时人声包络驱动灯效衰减/闪烁；也可以在
+调参页把衰减参数应用到实时数据，或点麦克风切回纯模拟。
+
+这不是网页。真实 KWS 由 live_kws.py 子进程负责；它只读麦克风，不写 PWM。
+本 UI 独占 A18/PWM6 与 A19/PWM7 时，退出前会先停 KWS，再恢复生产语音。
+
+运行:
+    python3 lamp_ui.py                 # 实时 KWS + 灯效
+    python3 lamp_ui.py --no-live       # 纯模拟/自动演示
+    python3 lamp_ui.py --preview       # 只生成预览图
+
+自动演示/截图测试:
+    python3 lamp_ui.py --seconds 8 --auto-demo --snapshot /root/surplife/artifacts/lamp_ui_live.png
+
+后台 voice_pwm.py 运行时需要先暂停，UI 会弹窗询问；退出 UI 后自动恢复。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+
+from maix import image
+
+W, H = 640, 480
+FPS = 15
+STEP_S = 0.020
+LAMP_PATCH = (72, 76, 222, 200)
+
+RUN_DIR = "/root/surplife/run"
+LOG_DIR = "/root/surplife/logs"
+ARTIFACTS_DIR = "/root/surplife/artifacts"
+KWS_FIFO = RUN_DIR + "/lamp_ui_kws.fifo"
+KWS_LOG = LOG_DIR + "/lamp_ui_kws.log"
+KWS_PID = RUN_DIR + "/lamp_ui_kws.pid"
+
+# ---------------------------------------------------------------------------
+# palette
+# ---------------------------------------------------------------------------
+
+BG = (10, 11, 13)
+PANEL = (19, 21, 25)
+PANEL_DEEP = (14, 16, 20)
+STAGE = (12, 14, 17)
+RAISED = (26, 29, 35)
+LINE = (43, 47, 56)
+TEXT = (244, 241, 234)
+TEXT2 = (167, 173, 184)
+TEXT3 = (110, 116, 128)
+AMBER = (255, 180, 94)
+AMBER_PEAK = (255, 211, 154)
+AMBER_DIM = (116, 79, 39)
+EMBER = (232, 102, 60)
+CYAN = (95, 214, 229)
+CYAN_DIM = (36, 82, 88)
+GREEN = (116, 224, 168)
+GREEN_DIM = (42, 87, 65)
+YELLOW = (245, 196, 81)
+RED = (255, 107, 107)
+RED_DIM = (105, 40, 40)
+
+
+def rgb(r, g, b):
+    return image.Color.from_rgb(int(r), int(g), int(b))
+
+
+def mix(a, b, t):
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    return rgb(a[0] + (b[0] - a[0]) * t,
+               a[1] + (b[1] - a[1]) * t,
+               a[2] + (b[2] - a[2]) * t)
+
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+C_BG = rgb(*BG)
+C_PANEL = rgb(*PANEL)
+C_PANEL_DEEP = rgb(*PANEL_DEEP)
+C_STAGE = rgb(*STAGE)
+C_RAISED = rgb(*RAISED)
+C_LINE = rgb(*LINE)
+C_TEXT = rgb(*TEXT)
+C_TEXT2 = rgb(*TEXT2)
+C_TEXT3 = rgb(*TEXT3)
+C_AMBER = rgb(*AMBER)
+C_AMBER_PEAK = rgb(*AMBER_PEAK)
+C_AMBER_DIM = rgb(*AMBER_DIM)
+C_EMBER = rgb(*EMBER)
+C_CYAN = rgb(*CYAN)
+C_CYAN_DIM = rgb(*CYAN_DIM)
+C_GREEN = rgb(*GREEN)
+C_GREEN_DIM = rgb(*GREEN_DIM)
+C_YELLOW = rgb(*YELLOW)
+C_RED = rgb(*RED)
+C_RED_DIM = rgb(*RED_DIM)
+
+# ---------------------------------------------------------------------------
+# fonts + draw helpers
+# ---------------------------------------------------------------------------
+
+_CJK = "/maixapp/share/font/SourceHanSansCN-Regular.otf"
+_MONO = "/usr/share/fonts/dejavu/DejaVuSansMono.ttf"
+_FONTS_READY = False
+
+
+def load_fonts():
+    global _FONTS_READY
+    if _FONTS_READY:
+        return
+    cjk = _CJK
+    if not os.path.exists(cjk):
+        cjk = "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc"
+    mono = _MONO
+    if not os.path.exists(mono):
+        mono = "/usr/share/fonts/dejavu/DejaVuSans.ttf"
+    for size in (9, 10, 11, 12, 14, 16, 20, 24, 28):
+        try:
+            image.load_font("ui%d" % size, cjk, size)
+        except Exception as exc:
+            print("font ui%d: %s" % (size, exc))
+    for size in (8, 9, 10, 11, 12, 14, 16, 20, 28, 44):
+        try:
+            image.load_font("mono%d" % size, mono, size)
+        except Exception as exc:
+            print("font mono%d: %s" % (size, exc))
+    _FONTS_READY = True
+
+
+def text(img, x, y, s, color, font="ui12", align="left", wrap=False):
+    s = str(s)
+    if align != "left":
+        try:
+            w = image.string_size(s, font=font)[0]
+        except Exception:
+            w = len(s) * 7
+        x = x - w if align == "right" else x - w // 2
+    img.draw_string(int(x), int(y), s, color, font=font, wrap=wrap)
+
+
+def text_width(s, font):
+    try:
+        return image.string_size(str(s), font=font)[0]
+    except Exception:
+        return len(str(s)) * 7
+
+
+def clip_text(s, font, max_w):
+    s = str(s)
+    if text_width(s, font) <= max_w:
+        return s
+    out = s
+    while out and text_width(out + "…", font) > max_w:
+        out = out[:-1]
+    return (out + "…") if out else ""
+
+
+def panel(img, x, y, w, h, fill=C_PANEL, border=C_LINE):
+    img.draw_rect(x, y, w, h, fill, -1)
+    img.draw_rect(x, y, w, h, border, 1)
+
+
+def dashed_hline(img, x1, x2, y, color, dash=5, gap=5):
+    x = x1
+    while x < x2:
+        img.draw_line(x, y, min(x + dash, x2), y, color, 1)
+        x += dash + gap
+
+
+# ---------------------------------------------------------------------------
+# parameters
+# ---------------------------------------------------------------------------
+
+PARAM_DEFS = {
+    "light_threshold": ("LIGHT_THRESHOLD", "回待机阈值", "%", 5, 15, 60),
+    "work_decay": ("WORK_DECAY", "有人声每 tick 衰减", "", 0.5, 0.0, 5.0),
+    "release_decay": ("RELEASE_DECAY", "人声结束每 tick 衰减", "", 0.5, 0.0, 10.0),
+    "decay_tick_ms": ("DECAY_TICK_MS", "每 tick 时长", "ms", 10, 10, 100),
+}
+
+DEFAULT_PARAMS = {
+    "light_threshold": 35,
+    "work_decay": 1.0,
+    "release_decay": 3.0,
+    "decay_tick_ms": 20,
+}
+
+PRESETS = {
+    "soft": ("柔和", "SOFT", {"light_threshold": 25, "work_decay": 1.0,
+                              "release_decay": 1.0, "decay_tick_ms": 30}),
+    "quick": ("灵敏", "QUICK", {"light_threshold": 35, "work_decay": 0.7,
+                                "release_decay": 4.5, "decay_tick_ms": 20}),
+    "default": ("默认", "DEFAULT", dict(DEFAULT_PARAMS)),
+}
+
+
+class Params:
+    def __init__(self):
+        self.light_threshold = 35
+        self.work_decay = 1.0
+        self.release_decay = 3.0
+        self.decay_tick_ms = 20
+        # fixed business/standby envelope, mirrors voice_pwm.py defaults
+        self.business_min = 40.0
+        self.business_max = 100.0
+        self.standby_min = 5.0
+        self.standby_max = 35.0
+        self.standby_period = 4.0
+        self.blink_hz_min = 1.0
+        self.blink_hz_max = 8.0
+
+    def normalize(self):
+        self.light_threshold = int(clamp(round(self.light_threshold), 15, 60))
+        self.work_decay = round(clamp(self.work_decay, 0.0, 5.0) * 2) / 2
+        self.release_decay = round(clamp(self.release_decay, 0.0, 10.0) * 2) / 2
+        self.decay_tick_ms = int(clamp(round(self.decay_tick_ms / 10) * 10, 10, 100))
+        self.business_min = max(40.0, float(self.light_threshold) + 1.0)
+
+    def value(self, key):
+        return getattr(self, key)
+
+    def adjust(self, key, direction):
+        label, desc, unit, step, lo, hi = PARAM_DEFS[key]
+        value = getattr(self, key) + step * direction
+        setattr(self, key, clamp(value, lo, hi))
+        self.normalize()
+
+    def apply_preset(self, name):
+        changes = PRESETS[name][2]
+        for k, v in changes.items():
+            setattr(self, k, v)
+        self.normalize()
+
+    def matches(self, name):
+        changes = PRESETS[name][2]
+        return all(getattr(self, k) == v for k, v in changes.items())
+
+    def format(self, key):
+        value = getattr(self, key)
+        if key == "decay_tick_ms":
+            return "%d" % int(value), "ms"
+        if key == "light_threshold":
+            return "%d" % int(value), "%"
+        return "%.1f" % float(value), ""
+
+
+# ---------------------------------------------------------------------------
+# PWM (sysfs, no maix mmap involved)
+# ---------------------------------------------------------------------------
+
+class PwmChannel:
+    def __init__(self, path, period_ns):
+        self.path = path
+        self.period_ns = int(period_ns)
+        self.last = -1
+
+    def _write(self, name, value):
+        with open(os.path.join(self.path, name), "w") as f:
+            f.write(str(int(value)))
+
+    def _ensure_export(self):
+        if os.path.isdir(self.path):
+            return
+        chip = os.path.dirname(self.path)
+        channel = os.path.basename(self.path).replace("pwm", "")
+        try:
+            with open(os.path.join(chip, "export"), "w") as f:
+                f.write(channel)
+        except OSError as exc:
+            import errno
+            if exc.errno != errno.EBUSY:
+                raise
+        for _ in range(50):
+            if os.path.isdir(self.path):
+                return
+            time.sleep(0.01)
+        raise RuntimeError("PWM export failed: %s" % self.path)
+
+    def init(self):
+        self._ensure_export()
+        self._write("enable", 0)
+        self._write("period", self.period_ns)
+        self._write("duty_cycle", 0)
+        self._write("enable", 1)
+        self.last = -1
+
+    def set_percent(self, percent):
+        percent = clamp(float(percent), 0.0, 100.0)
+        duty = int(round(self.period_ns * percent / 100.0))
+        if duty == self.last:
+            return
+        self._write("duty_cycle", duty)
+        self.last = duty
+
+    def off(self):
+        try:
+            self._write("duty_cycle", 0)
+            self._write("enable", 0)
+        except OSError:
+            pass
+        self.last = 0
+
+
+class PwmOutput:
+    A18 = "/sys/class/pwm/pwmchip4/pwm2"
+    A19 = "/sys/class/pwm/pwmchip4/pwm3"
+    PERIOD_NS = 55555  # 18.0 kHz
+
+    def __init__(self):
+        self.a18 = PwmChannel(self.A18, self.PERIOD_NS)
+        self.a19 = PwmChannel(self.A19, self.PERIOD_NS)
+
+    def init(self):
+        from maix import err, pinmap
+        for pin, func in (("A18", "PWM6"), ("A19", "PWM7")):
+            ret = pinmap.set_pin_function(pin, func)
+            if ret != err.Err.ERR_NONE:
+                raise RuntimeError("pinmap %s -> %s failed: %s" % (pin, func, ret))
+        self.a18.init()
+        try:
+            self.a19.init()
+        except Exception:
+            self.a18.off()
+            raise
+        self.a18.set_percent(0)
+        self.a19.set_percent(0)
+
+    def apply(self, light, a19_duty):
+        self.a18.set_percent(light)
+        self.a19.set_percent(a19_duty)
+
+    def off(self):
+        self.a18.off()
+        self.a19.off()
+
+
+def find_voice_app():
+    """Return pid of voice_pwm.py if it is running."""
+    own = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == own:
+            continue
+        try:
+            with open("/proc/%s/cmdline" % name, "rb") as f:
+                raw = f.read().replace(b"\x00", b" ")
+            cmd = raw.decode("utf-8", "ignore")
+        except OSError:
+            continue
+        if "voice_pwm.py" in cmd and "grep" not in cmd:
+            return pid
+    return None
+
+
+def stop_voice_app():
+    script = "/root/surplife/app/stop_voice_pwm.sh"
+    if not os.path.exists(script):
+        return False, "missing stop_voice_pwm.sh"
+    try:
+        subprocess.run([script], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=8, check=False)
+    except Exception as exc:
+        return False, str(exc)
+    for _ in range(30):
+        pid = find_voice_app()
+        if pid is None:
+            return True, "stopped"
+        time.sleep(0.1)
+    return False, "voice_pwm.py still running"
+
+
+def start_voice_app():
+    script = "/root/surplife/app/start_voice_pwm.sh"
+    if not os.path.exists(script):
+        return False
+    try:
+        subprocess.run([script], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=8, check=False)
+    except Exception as exc:
+        print("start_voice_pwm: %s" % exc, flush=True)
+        return False
+    for _ in range(40):
+        if find_voice_app():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class LiveKws:
+    """UI 侧的本地 KWS 进程管理 + 非阻塞 JSON FIFO 读取。"""
+
+    def __init__(self):
+        self.proc = None
+        self.fd = None
+        self.logf = None
+        self.buf = b""
+        self.last = None
+        self.error = ""
+        self.started_at = 0.0
+
+    def start(self):
+        self.stop()
+        self.error = ""
+        self.buf = b""
+        self.last = None
+        try:
+            for directory in (RUN_DIR, LOG_DIR, ARTIFACTS_DIR):
+                os.makedirs(directory, exist_ok=True)
+            try:
+                os.unlink(KWS_FIFO)
+            except FileNotFoundError:
+                pass
+            os.mkfifo(KWS_FIFO, 0o600)
+            self.fd = os.open(KWS_FIFO, os.O_RDONLY | os.O_NONBLOCK)
+        except Exception as exc:
+            self.error = "创建 KWS FIFO 失败: %s" % exc
+            self._cleanup()
+            return False
+
+        try:
+            self.logf = open(KWS_LOG, "ab", buffering=0)
+            worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "live_kws.py")
+            env = os.environ.copy()
+            env.setdefault("SURPLIFE_LOG", "WARNING")
+            self.proc = subprocess.Popen(
+                [sys.executable, worker, "--fifo", KWS_FIFO],
+                stdin=subprocess.DEVNULL, stdout=self.logf, stderr=self.logf,
+                env=env, start_new_session=True)
+            self.started_at = time.monotonic()
+            with open(KWS_PID, "w") as f:
+                f.write(str(self.proc.pid))
+            return True
+        except Exception as exc:
+            self.error = "启动 live_kws.py 失败: %s" % exc
+            self._cleanup()
+            return False
+
+    def poll(self):
+        if self.fd is not None:
+            while True:
+                try:
+                    chunk = os.read(self.fd, 4096)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self.buf += chunk
+                if len(self.buf) > 131072:
+                    self.buf = self.buf[-8192:]
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line.decode("utf-8", "ignore"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(data, dict):
+                    self.last = data
+        return self.last
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self):
+        proc = self.proc
+        self.proc = None
+        if proc is not None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+        self._cleanup()
+
+    def _cleanup(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        if self.logf is not None:
+            try:
+                self.logf.close()
+            except OSError:
+                pass
+            self.logf = None
+        try:
+            os.unlink(KWS_FIFO)
+        except OSError:
+            pass
+        try:
+            os.unlink(KWS_PID)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# lamp simulation (same decay shape as the deployed voice_pwm.py)
+# ---------------------------------------------------------------------------
+
+def breathing_duty(t, period=4.0, lo=5.0, hi=35.0):
+    phase = (math.sin(2.0 * math.pi * t / period - math.pi / 2.0) + 1.0) / 2.0
+    return lo + (hi - lo) * phase
+
+
+def business_brightness(level, lo=40.0, hi=100.0):
+    level = clamp(level, 0.0, 1.0)
+    return lo + (hi - lo) * level
+
+
+class LampSim:
+    """The bench state machine.
+
+    Default mode is local simulation; `live=True` replaces the simulated
+    envelope with values published by live_kws.py, while keeping the same
+    decay / breathing / A19 math.
+    """
+
+    def __init__(self):
+        self.params = Params()
+        self.params.normalize()
+        self.live = False
+        self.live_ready = False
+        self.live_env = 0.0
+        self.live_env_slow = 0.0
+        self.live_peak = 0.0
+        self.live_prob = 0.0
+        self.live_gate_seq = 0
+        self.reset(quiet=True)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def reset(self, keep_auto_demo=False, quiet=False):
+        keep_demo = bool(self.auto_demo) if keep_auto_demo else False
+        self.time_s = 0.0
+        self.phase = "standby"
+        self.light = 0.0
+        self.env = 0.0
+        self.env_slow = 0.0
+        self.ref = 0.002
+        self.peaks = []
+        self.voice_active = False
+        self.gate_flash_until = -1.0
+        self.blink_phase = 0.0
+        self.holding = False
+        self.burst_until = -1.0
+        self.auto_demo = keep_demo
+        self._demo_cycle = -1
+        self._demo_fired = set()
+        self.events = []
+        self.last_event = "BENCH READY"
+        self.markers = []
+        self.history = []
+        self.next_history = 0.0
+        self.live_env = 0.0
+        self.live_env_slow = 0.0
+        self.live_peak = 0.0
+        self.live_prob = 0.0
+        self._seed_history()
+        if not quiet:
+            self.add_event("RESET", "回到待机 · 参数保留")
+
+    def _seed_history(self):
+        # Pre-roll with the same standby breathing shape, so the 10 s timeline
+        # is immediately meaningful instead of a flat zero line.
+        p = self.params
+        for i in range(101):
+            t = -10.0 + i * 0.1
+            self.history.append((t, 0.0,
+                                 breathing_duty(t, p.standby_period,
+                                                p.standby_min, p.standby_max),
+                                 "standby", False))
+
+    # -- readouts ----------------------------------------------------------
+
+    def effective_tick_s(self):
+        return max(0.010, float(self.params.decay_tick_ms) / 1000.0)
+
+    def level(self):
+        if self.ref <= 1e-6:
+            return 0.0
+        return clamp(self.env / self.ref, 0.0, 1.0)
+
+    def level_slow(self):
+        if self.ref <= 1e-6:
+            return 0.0
+        return clamp(self.env_slow / self.ref, 0.0, 1.0)
+
+    def blink_hz(self):
+        if self.phase != "business":
+            return 0.0
+        p = self.params
+        return p.blink_hz_min + (p.blink_hz_max - p.blink_hz_min) * self.level_slow()
+
+    def a19_duty(self):
+        if self.phase != "business":
+            return 0.0
+        return self.level_slow() * 100.0
+
+    def display_light(self):
+        if self.phase == "business":
+            return clamp(self.light, 0.0, 100.0)
+        p = self.params
+        return breathing_duty(self.time_s, p.standby_period,
+                              p.standby_min, p.standby_max)
+
+    def state(self):
+        if self.phase != "business":
+            return "standby"
+        if self.voice_active:
+            return "voice"
+        if self.time_s < self.gate_flash_until:
+            return "gate"
+        return "release"
+
+    # -- events ------------------------------------------------------------
+
+    def add_event(self, kind, text):
+        self.events.append((self.time_s, kind, text))
+        if len(self.events) > 30:
+            self.events = self.events[-30:]
+        self.last_event = text
+
+    # -- inputs ------------------------------------------------------------
+
+    def _voice_wave(self):
+        t = self.time_s
+        base = 0.78 + 0.045 * math.sin(2.0 * math.pi * 3.1 * t) \
+            + 0.022 * math.sin(2.0 * math.pi * 7.3 * t)
+        return clamp(base, 0.25, 0.96)
+
+    def _demo_env(self):
+        cycle = self.time_s % 16.0
+        if cycle < 2.0:
+            return 0.0
+        if cycle < 2.7:
+            return 0.40 + (0.95 - 0.40) * ((cycle - 2.0) / 0.7)
+        if cycle < 3.2:
+            return 0.95
+        if cycle < 5.0:
+            return 0.58 + 0.34 * (0.5 + 0.5 * math.sin(
+                2.0 * math.pi * 1.7 * (cycle - 3.2)))
+        if cycle < 5.6:
+            return 0.62 * (1.0 - (cycle - 5.0) / 0.6)
+        if cycle < 8.0:
+            return 0.0
+        if cycle < 8.6:
+            return 0.30 + (0.72 - 0.30) * ((cycle - 8.0) / 0.6)
+        if cycle < 11.2:
+            return 0.66 + 0.14 * math.sin(2.0 * math.pi * 2.3 * (cycle - 8.6))
+        if cycle < 11.8:
+            return 0.58 * (1.0 - (cycle - 11.2) / 0.6)
+        return 0.0
+
+    def _raw_env(self):
+        if self.live:
+            return clamp(self.live_env, 0.0, 1.0)
+        if self.holding or self.time_s < self.burst_until:
+            return self._voice_wave()
+        if self.auto_demo:
+            return self._demo_env()
+        return 0.0
+
+    def _peak(self):
+        if self.live:
+            return max(0.0, self.live_peak)
+        if not self.peaks:
+            return 0.0
+        return max(v for _, v in self.peaks)
+
+    def release_hold(self, duration):
+        self.holding = False
+        if duration < 0.22:
+            # A tap is a short phrase, not an instant release.
+            self.burst_until = max(self.burst_until, self.time_s + 0.95)
+
+    def gate(self):
+        if self.auto_demo:
+            self.auto_demo = False
+            self.add_event("DEMO", "手动接管 · 自动演示关闭")
+        self._inject_gate()
+
+    def _inject_gate(self, prob=None):
+        raw = self._raw_env()
+        if raw > self.env:
+            self.env = raw
+        if raw > self.env_slow:
+            self.env_slow = raw
+        self.ref = max(self._peak(), self.env, raw, 0.002)
+        self.phase = "business"
+        self.voice_active = False
+        self.gate_flash_until = self.time_s + 0.70
+        self.blink_phase = 0.0
+        level = self.level()
+        p = self.params
+        self.light = max(business_brightness(level, p.business_min, p.business_max),
+                         float(p.light_threshold) + 1.0, p.business_min)
+        self.markers.append((self.time_s, "gate"))
+        if len(self.markers) > 30:
+            self.markers = self.markers[-30:]
+        if prob is None:
+            self.add_event("GATE", "门控通过 · 长春")
+        else:
+            self.add_event("GATE", "门控通过 · 长春 · p=%.2f" % float(prob))
+
+    def live_update(self, env, env_slow, peak, prob, gate_seq):
+        """Feed one live KWS sample; a gate counter increase triggers business."""
+        if not self.live:
+            return
+        self.live_env = clamp(float(env or 0.0), 0.0, 1.0)
+        self.live_env_slow = clamp(float(env_slow or 0.0), 0.0, 1.0)
+        self.live_peak = max(0.0, float(peak or 0.0))
+        self.live_prob = clamp(float(prob or 0.0), 0.0, 1.0)
+        try:
+            seq = int(gate_seq or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        if seq > self.live_gate_seq:
+            self.live_gate_seq = seq
+            self._inject_gate(prob=self.live_prob)
+
+    def set_auto_demo(self, on):
+        if on:
+            self.auto_demo = False
+            self.reset(keep_auto_demo=False, quiet=True)
+            self.auto_demo = True
+            self._demo_cycle = -1
+            self._demo_fired = set()
+            self.add_event("DEMO", "16s 自动演示 · 2s 门控")
+        else:
+            self.auto_demo = False
+            self.add_event("DEMO", "自动演示关闭")
+
+    def force_standby(self):
+        self.holding = False
+        self.auto_demo = False
+        self.burst_until = -1.0
+        self.phase = "standby"
+        self.light = 0.0
+        self.ref = 0.002
+        self.env = 0.0
+        self.env_slow = 0.0
+        self.voice_active = False
+        self.markers.append((self.time_s, "exit"))
+        self.add_event("STANDBY", "强制待机")
+
+    def _auto_demo_gates(self):
+        cycle = int(self.time_s // 16.0)
+        if cycle != self._demo_cycle:
+            self._demo_cycle = cycle
+            self._demo_fired = set()
+        pos = self.time_s % 16.0
+        if pos >= 2.0 and "g1" not in self._demo_fired:
+            self._demo_fired.add("g1")
+            self._inject_gate()
+        if pos >= 8.0 and "g2" not in self._demo_fired:
+            self._demo_fired.add("g2")
+            self._inject_gate()
+
+    # -- step --------------------------------------------------------------
+
+    def step(self, dt):
+        dt = clamp(float(dt), 0.001, 0.100)
+        self.time_s += dt
+        if self.auto_demo and not self.live:
+            self._auto_demo_gates()
+
+        if self.live:
+            # live_kws 已经做了快/慢包络，这里直接使用，避免二次平滑拖慢。
+            raw = clamp(self.live_env, 0.0, 1.0)
+            self.env = raw
+            self.env_slow = clamp(self.live_env_slow, 0.0, 1.0)
+        else:
+            raw = self._raw_env()
+            if raw > self.env:
+                self.env = raw
+            else:
+                self.env += (raw - self.env) * min(1.0, dt / 0.35)
+            if raw > self.env_slow:
+                self.env_slow = raw
+            else:
+                self.env_slow += (raw - self.env_slow) * min(1.0, dt / 0.55)
+
+        self.peaks.append((self.time_s, max(raw, self.env)))
+        cutoff = self.time_s - 1.5
+        while self.peaks and self.peaks[0][0] < cutoff:
+            self.peaks.pop(0)
+
+        hz = self.blink_hz()
+        if hz > 0.0:
+            self.blink_phase = (self.blink_phase + hz * dt) % 1.0
+
+        p = self.params
+        if self.phase == "business":
+            floor = max(0.0015, 0.02 * self.ref)
+            active = self.env >= floor
+            if active != self.voice_active:
+                if active:
+                    self.add_event("VOICE", "人声出现 · 业务保持")
+                else:
+                    self.add_event("RELEASE", "人声结束 · 释放衰减")
+            self.voice_active = active
+
+            level = self.level()
+            target = business_brightness(level, p.business_min, p.business_max) if active else 0.0
+            decay = p.work_decay if active else p.release_decay
+            amount = decay * (dt / self.effective_tick_s())
+            if target >= self.light:
+                self.light = target
+            else:
+                self.light = max(target, self.light - amount)
+
+            if self.light < float(p.light_threshold):
+                self.phase = "standby"
+                self.light = 0.0
+                self.voice_active = False
+                self.markers.append((self.time_s, "exit"))
+                if len(self.markers) > 30:
+                    self.markers = self.markers[-30:]
+                self.add_event("STANDBY", "衰减完成 · 回到待机呼吸")
+
+        if self.time_s >= self.next_history:
+            self.history.append((self.time_s, self.env, self.display_light(),
+                                 self.phase, self.voice_active))
+            self.next_history = self.time_s + 0.1
+            while self.history and self.history[0][0] < self.time_s - 10.5:
+                self.history.pop(0)
+
+
+STATE_META = {
+    "standby": ("待机", "STANDBY BREATH", TEXT2, LINE),
+    "gate": ("已唤醒", "GATE PASSED", GREEN, GREEN_DIM),
+    "voice": ("语音中", "VOICE ACTIVE", AMBER, AMBER_DIM),
+    "release": ("释放", "RELEASE DECAY", CYAN, CYAN_DIM),
+}
+
+
+def format_tick(seconds):
+    ms = int(max(0.0, seconds) * 1000)
+    return "T+%02d:%03d" % (ms // 1000, ms % 1000)
+
+
+# ---------------------------------------------------------------------------
+# touch UI
+# ---------------------------------------------------------------------------
+
+PARAM_ORDER = ("light_threshold", "work_decay", "release_decay", "decay_tick_ms")
+PARAM_CARDS = {
+    "light_threshold": (16, 84, 296, 104),
+    "work_decay": (328, 84, 296, 104),
+    "release_decay": (16, 200, 296, 104),
+    "decay_tick_ms": (328, 200, 296, 104),
+}
+
+RECT_TAB_BENCH = (162, 0, 80, 44)
+RECT_TAB_TUNE = (244, 0, 80, 44)
+RECT_EXIT = (584, 4, 48, 38)
+RECT_GATE = (404, 56, 220, 104)
+RECT_LIVE = (560, 64, 48, 48)
+RECT_DEMO = (404, 170, 220, 42)
+RECT_STANDBY = (404, 220, 106, 38)
+RECT_RESET = (518, 220, 106, 38)
+RECT_HW = (516, 392, 96, 32)
+RECT_MODAL_CANCEL = (100, 300, 190, 40)
+RECT_MODAL_TAKEOVER = (350, 300, 190, 40)
+PRESET_RECTS = {
+    "soft": (16, 318, 196, 48),
+    "quick": (220, 318, 196, 48),
+    "default": (424, 318, 196, 48),
+}
+
+
+def inside(x, y, rect):
+    rx, ry, rw, rh = rect
+    return rx <= x < rx + rw and ry <= y < ry + rh
+
+
+class LampUI:
+    def __init__(self):
+        load_fonts()
+        self.img = image.Image(W, H, image.Format.FMT_RGB888)
+        self.sim = LampSim()
+        self.live = LiveKws()
+        self.live_on = False
+        self.live_ready = False
+        self.live_error = ""
+        self.live_last_seq = 0
+        self.live_started = 0.0
+        self.view = "bench"
+        self.modal = None
+        self.hw_on = False
+        self.hw = None
+        self.hw_error = ""
+        self.stopped_voice = False
+        self.exit_requested = False
+        self.touch_down = False
+        self.press_ctrl = None
+        self.press_time = 0.0
+        self.repeat_ctrl = None
+        self.repeat_next = 0.0
+        self.now = 0.0
+        self.last_render_ms = 0.0
+        self.frames = 0
+        self.debug = os.environ.get("LAMP_UI_DEBUG") == "1"
+        self.prepared = False
+        self.bg_bench = None
+        self.bg_tune = None
+        self.bg_modal = None
+        self.lamp_frames = []
+        self.timeline_base = None
+        self.timeline_img = None
+        self.last_timeline_update = -1.0
+
+    # -- update ------------------------------------------------------------
+
+    def update(self, dt, now):
+        self.now = now
+        if self.live_on:
+            self._poll_live()
+        if self.modal is None:
+            remaining = clamp(dt, 0.0, 0.12)
+            steps = 0
+            while remaining >= STEP_S - 1e-6 and steps < 6:
+                self.sim.step(STEP_S)
+                remaining -= STEP_S
+                steps += 1
+            if self.hw_on:
+                self._apply_hw()
+
+        if self.repeat_ctrl is not None and self.touch_down and now >= self.repeat_next:
+            ctrl = self.repeat_ctrl
+            if ctrl and ctrl[0] == "param":
+                self.sim.params.adjust(ctrl[1], ctrl[2])
+                self.repeat_next = now + 0.11
+
+        if self.prepared and now - self.last_timeline_update >= 0.20:
+            self._update_timeline(now)
+
+    # -- live KWS ----------------------------------------------------------
+
+    def start_live(self):
+        if self.live_on:
+            return True
+        pid = find_voice_app()
+        if pid is not None:
+            ok, msg = stop_voice_app()
+            if not ok:
+                self.live_error = "暂停后台语音失败: %s" % msg
+                self.sim.add_event("KWS", self.live_error)
+                return False
+            self.stopped_voice = True
+        self.sim.set_auto_demo(False)
+        self.sim.reset(quiet=True)
+        self.sim.live = True
+        self.sim.live_ready = False
+        self.sim.live_gate_seq = 0
+        self.live_last_seq = 0
+        self.live_ready = False
+        self.live_error = ""
+        self.live_on = True
+        self.sim.add_event("KWS", "启动本地语音模型…")
+        if not self.live.start():
+            self.live_on = False
+            self.sim.live = False
+            self.sim.live_ready = False
+            self.live_error = self.live.error or "KWS 启动失败"
+            self.sim.add_event("KWS", self.live_error)
+            return False
+        self.live_started = self.now
+        return True
+
+    def stop_live(self):
+        was_on = self.live_on or self.live.proc is not None
+        self.live.stop()
+        self.live_on = False
+        self.live_ready = False
+        self.sim.live = False
+        self.sim.live_ready = False
+        if was_on:
+            self.sim.add_event("KWS", "实时语音关闭 · 模拟模式")
+
+    def toggle_live(self):
+        if self.live_on:
+            self.stop_live()
+        else:
+            self.start_live()
+
+    def _fail_live(self, msg):
+        self.live.stop()
+        self.live_on = False
+        self.live_ready = False
+        self.sim.live = False
+        self.sim.live_ready = False
+        self.live_error = msg
+        self.sim.add_event("KWS", "实时语音停止 · " + msg)
+
+    def _poll_live(self):
+        state = self.live.poll()
+        if state is not None:
+            if state.get("state") == "error":
+                self._fail_live(state.get("error") or "KWS 错误")
+                return
+            ready = bool(state.get("ready"))
+            if ready and not self.live_ready:
+                self.live_ready = True
+                self.sim.live_ready = True
+                self.sim.add_event("KWS", "本地模型就绪 · 请说“长春”")
+            elif not ready:
+                self.sim.live_ready = False
+            gate = state.get("gate", 0)
+            try:
+                self.live_last_seq = max(self.live_last_seq, int(gate or 0))
+            except (TypeError, ValueError):
+                pass
+            self.sim.live_update(
+                state.get("env", 0.0), state.get("env_slow", 0.0),
+                state.get("peak", 0.0), state.get("prob", 0.0),
+                self.live_last_seq)
+        if not self.live.alive():
+            self._fail_live("KWS 进程已退出")
+
+    def _apply_hw(self):
+        if not self.hw_on or self.hw is None:
+            return
+        try:
+            self.hw.apply(self.sim.display_light(), self.sim.a19_duty())
+        except Exception as exc:
+            self.hw_error = "PWM 写入失败: %s" % exc
+            print(self.hw_error, flush=True)
+            self.disable_hardware(silent=True)
+
+    # -- touch -------------------------------------------------------------
+
+    def _map_touch(self, x, y):
+        if os.environ.get("LAMP_UI_TOUCH_SWAP") == "1":
+            x, y = y, x
+        if os.environ.get("LAMP_UI_TOUCH_FLIP_X") == "1":
+            x = (H - 1) - x if os.environ.get("LAMP_UI_TOUCH_SWAP") == "1" else (W - 1) - x
+        if os.environ.get("LAMP_UI_TOUCH_FLIP_Y") == "1":
+            y = (W - 1) - y if os.environ.get("LAMP_UI_TOUCH_SWAP") == "1" else (H - 1) - y
+        return int(clamp(x, 0, W - 1)), int(clamp(y, 0, H - 1))
+
+    def handle_touch(self, x, y, pressed, now):
+        x, y = self._map_touch(x, y)
+        if pressed:
+            if not self.touch_down:
+                self.touch_down = True
+                self.press_time = now
+                self.press_ctrl = self._hit_test(x, y)
+                if self.press_ctrl and self.press_ctrl[0] == "param":
+                    self.repeat_ctrl = self.press_ctrl
+                    self.repeat_next = now + 0.38
+                else:
+                    self.repeat_ctrl = None
+                self._on_press(self.press_ctrl, now)
+        else:
+            if self.touch_down:
+                duration = max(0.0, now - self.press_time)
+                self._on_release(self.press_ctrl, duration, now)
+                self.touch_down = False
+                self.press_ctrl = None
+                self.repeat_ctrl = None
+
+    def _hit_test(self, x, y):
+        if self.modal is not None:
+            if inside(x, y, RECT_MODAL_CANCEL):
+                return ("modal_cancel",)
+            if inside(x, y, RECT_MODAL_TAKEOVER):
+                return ("modal_takeover",)
+            return None
+        if inside(x, y, RECT_TAB_BENCH):
+            return ("tab", "bench")
+        if inside(x, y, RECT_TAB_TUNE):
+            return ("tab", "tune")
+        if inside(x, y, RECT_EXIT):
+            return ("exit",)
+        if self.view == "bench":
+            if inside(x, y, RECT_LIVE):
+                return ("live",)
+            if inside(x, y, RECT_GATE):
+                return ("gate",)
+            if inside(x, y, RECT_DEMO):
+                return ("demo",)
+            if inside(x, y, RECT_STANDBY):
+                return ("standby",)
+            if inside(x, y, RECT_RESET):
+                return ("reset",)
+        else:
+            for key in PARAM_ORDER:
+                cx, cy, cw, ch = PARAM_CARDS[key]
+                if inside(x, y, (cx + cw - 100, cy + ch - 42, 40, 32)):
+                    return ("param", key, -1)
+                if inside(x, y, (cx + cw - 52, cy + ch - 42, 40, 32)):
+                    return ("param", key, 1)
+            for name, rect in PRESET_RECTS.items():
+                if inside(x, y, rect):
+                    return ("preset", name)
+            if inside(x, y, RECT_HW):
+                return ("hw",)
+        return None
+
+    def _on_press(self, ctrl, now):
+        if ctrl is None:
+            return
+        kind = ctrl[0]
+        if kind == "tab":
+            self.view = ctrl[1]
+            return
+        if kind == "exit":
+            self.exit_requested = True
+            return
+        if kind == "modal_cancel":
+            self.modal = None
+            self.hw_error = ""
+            return
+        if kind == "modal_takeover":
+            self.modal = None
+            ok, msg = stop_voice_app()
+            if ok:
+                self.stopped_voice = True
+                self.hw_error = ""
+                self.enable_hardware()
+            else:
+                self.hw_error = "停止后台语音失败: %s" % msg
+                self.view = "tune"
+            return
+        if kind == "live":
+            self.toggle_live()
+            return
+        if kind == "gate":
+            self.sim.holding = True
+            self.sim.gate()
+            return
+        if kind == "demo":
+            if self.live_on:
+                self.stop_live()
+            self.sim.set_auto_demo(not self.sim.auto_demo)
+            return
+        if kind == "standby":
+            self.sim.force_standby()
+            return
+        if kind == "reset":
+            self.sim.reset()
+            return
+        if kind == "param":
+            self.sim.params.adjust(ctrl[1], ctrl[2])
+            return
+        if kind == "preset":
+            self.sim.params.apply_preset(ctrl[1])
+            self.sim.add_event("PRESET", "参数预设 · " + PRESETS[ctrl[1]][0])
+            return
+        if kind == "hw":
+            self.toggle_hardware()
+            return
+
+    def _on_release(self, ctrl, duration, now):
+        if ctrl is None:
+            return
+        kind = ctrl[0]
+        if kind == "gate":
+            self.sim.release_hold(duration)
+        elif kind == "param":
+            key = ctrl[1]
+            label = PARAM_DEFS[key][0]
+            value, unit = self.sim.params.format(key)
+            self.sim.add_event("PARAM", "%s · %s%s" % (label, value, unit))
+
+    # -- hardware ----------------------------------------------------------
+
+    def toggle_hardware(self):
+        if self.hw_on:
+            self.disable_hardware()
+            return
+        pid = find_voice_app()
+        if pid is not None:
+            self.modal = "takeover"
+            return
+        self.enable_hardware()
+
+    def enable_hardware(self):
+        if self.hw_on:
+            return
+        self.hw_error = ""
+        try:
+            hw = PwmOutput()
+            hw.init()
+            hw.apply(self.sim.display_light(), self.sim.a19_duty())
+            self.hw = hw
+            self.hw_on = True
+            self.sim.add_event("PWM", "硬件输出开启 · 独占 A18/A19")
+        except Exception as exc:
+            self.hw_error = "硬件输出开启失败: %s" % exc
+            print(self.hw_error, flush=True)
+            self.hw = None
+            self.hw_on = False
+
+    def disable_hardware(self, silent=False):
+        if self.hw is not None:
+            try:
+                self.hw.off()
+            except Exception as exc:
+                print("PWM off: %s" % exc, flush=True)
+        self.hw = None
+        self.hw_on = False
+        if not silent:
+            self.sim.add_event("PWM", "硬件输出关闭 · 仅模拟")
+
+    def close(self):
+        self.stop_live()
+        if self.hw_on or self.hw is not None:
+            self.disable_hardware(silent=True)
+        if self.stopped_voice:
+            ok = start_voice_app()
+            if ok:
+                print("lamp_ui: 后台语音已恢复。", flush=True)
+            else:
+                print("lamp_ui: 后台语音自动恢复失败，请手动运行 "
+                      "/root/surplife/app/start_voice_pwm.sh", flush=True)
+
+    # -- render dispatch ---------------------------------------------------
+
+    def render(self):
+        t0 = time.perf_counter()
+        if not self.prepared:
+            self.prepare()
+        img = self.img
+        if self.modal is not None:
+            img.draw_image(0, 0, self.bg_modal)
+            self._draw_dynamic_header()
+        elif self.view == "bench":
+            img.draw_image(0, 0, self.bg_bench)
+            self._draw_dynamic_header()
+            self._draw_bench_dynamic()
+        else:
+            img.draw_image(0, 0, self.bg_tune)
+            self._draw_dynamic_header()
+            self._draw_tune_dynamic()
+        self.last_render_ms = (time.perf_counter() - t0) * 1000.0
+        self.frames += 1
+        return img
+
+    # -- header ------------------------------------------------------------
+
+    def _draw_header(self):
+        img = self.img
+        img.draw_rect(0, 0, W, 44, C_BG, -1)
+        img.draw_rect(0, 0, W, 2, C_AMBER_DIM, -1)
+        img.draw_rect(0, 43, W, 1, C_LINE, -1)
+
+        # brand mark
+        img.draw_rect(16, 10, 24, 24, C_PANEL_DEEP, -1)
+        img.draw_rect(16, 10, 24, 24, C_AMBER_DIM, 1)
+        pts = ((21, 26), (24, 18), (27, 24), (29, 14), (32, 22), (35, 17))
+        for i in range(len(pts) - 1):
+            img.draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
+                          C_AMBER, 1)
+        text(img, 48, 7, "LUMEN", C_TEXT, "ui16")
+        text(img, 100, 10, "/18k", C_AMBER, "ui14")
+        text(img, 48, 26, "VOICE-GATED PWM BENCH", C_TEXT3, "mono8")
+
+        self._draw_tab("灯效", 202, self.view == "bench")
+        self._draw_tab("调参", 284, self.view == "tune")
+
+        # sim / hardware status pill
+        hw_color = C_GREEN if self.hw_on else C_AMBER_DIM
+        img.draw_rect(330, 12, 44, 20, C_PANEL_DEEP, -1)
+        img.draw_rect(330, 12, 44, 20, hw_color, 1)
+        text(img, 352, 15, "HW" if self.hw_on else "SIM", hw_color, "mono9",
+             align="center")
+
+        state = self.sim.state()
+        label, sub, fg, dim = STATE_META[state]
+        fg_c, dim_c = rgb(*fg), rgb(*dim)
+        img.draw_rect(382, 10, 102, 24, C_PANEL_DEEP, -1)
+        img.draw_rect(382, 10, 102, 24, dim_c, 1)
+        img.draw_circle(393, 22, 3, fg_c, -1)
+        text(img, 429, 14, label, fg_c, "ui12", align="center")
+
+        text(img, 490, 15, format_tick(self.sim.time_s), C_TEXT2, "mono10")
+
+        img.draw_rect(590, 8, 34, 28, C_PANEL_DEEP, -1)
+        img.draw_rect(590, 8, 34, 28, C_LINE, 1)
+        img.draw_line(601, 16, 613, 28, C_TEXT2, 1)
+        img.draw_line(613, 16, 601, 28, C_TEXT2, 1)
+
+    def _draw_tab(self, label, cx, active):
+        color = C_AMBER if active else C_TEXT3
+        text(self.img, cx, 14, label, color, "ui12", align="center")
+        if active:
+            self.img.draw_rect(cx - 18, 38, 36, 2, C_AMBER, -1)
+
+    # -- bench -------------------------------------------------------------
+
+    def _draw_bench(self):
+        img = self.img
+        stage = self.sim.display_light()
+        panel(img, 16, 56, 376, 292, C_PANEL, C_LINE)
+        text(img, 28, 64, "A18 / PWM6 · 18.0 KHZ", C_TEXT3, "mono8")
+        text(img, 28, 78, "灯效测试台", C_TEXT2, "ui11")
+
+        self._draw_stage_visual(stage)
+        self._draw_stage_readouts(stage)
+
+        # hero duty, drawn after the glow so it stays crisp
+        img.draw_rect(296, 56, 96, 62, C_PANEL_DEEP, -1)
+        text(img, 382, 60, "A18 DUTY", C_TEXT3, "mono8", align="right")
+        text(img, 382, 76, "%d%%" % int(round(stage)), C_AMBER,
+             "mono28", align="right")
+        img.draw_rect(16, 56, 376, 292, C_LINE, 1)
+
+        self._draw_controls()
+        self._draw_timeline()
+
+    def _draw_stage_visual(self, stage):
+        img = self.img
+        # grid
+        for gx in range(28, 381, 32):
+            img.draw_line(gx, 100, gx, 280, rgb(26, 30, 37), 1)
+        for gy in range(100, 281, 30):
+            img.draw_line(28, gy, 380, gy, rgb(26, 30, 37), 1)
+
+        state = self.sim.state()
+        cx, cy = 186, 186
+        self._draw_lamp(cx, cy, stage)
+
+        label, sub, fg, dim = STATE_META[state]
+        text(img, 28, 260, sub, C_TEXT3, "mono8")
+        a19 = self.sim.blink_hz()
+        text(img, 380, 260, "A19 %.1f HZ" % a19, C_TEXT3, "mono8",
+             align="right")
+
+    def _draw_lamp(self, cx, cy, light):
+        img = self.img
+        glow = clamp(light / 100.0, 0.0, 1.0)
+        for i in range(32, 0, -1):
+            r = 90.0 * i / 32.0
+            t = 1.0 - i / 32.0
+            k = glow * (0.015 + 0.62 * t * t)
+            img.draw_circle(cx, cy, int(r), mix(STAGE, AMBER, k), -1)
+
+        # A19 orbit, rendered as dashes so it reads as instrumentation
+        for deg in range(0, 360, 15):
+            a = math.radians(deg)
+            x1 = cx + math.cos(a) * 100
+            y1 = cy + math.sin(a) * 100
+            x2 = cx + math.cos(a) * 106
+            y2 = cy + math.sin(a) * 106
+            img.draw_line(int(x1), int(y1), int(x2), int(y2), C_CYAN_DIM, 1)
+        if self.sim.phase == "business":
+            a = self.sim.blink_phase * 2.0 * math.pi - math.pi / 2.0
+            dx = cx + math.cos(a) * 103
+            dy = cy + math.sin(a) * 103
+            img.draw_circle(int(dx), int(dy), 4, C_CYAN, -1)
+
+        # bulb glass
+        img.draw_circle(cx, cy, 36, C_STAGE, -1)
+        for i in range(12, 0, -1):
+            r = 34.0 * i / 12.0
+            t = 1.0 - i / 12.0
+            k = glow * (0.05 + 0.85 * t * t)
+            img.draw_circle(cx, cy, int(r), mix(PANEL_DEEP, AMBER_PEAK, k), -1)
+        img.draw_circle(cx, cy, 36, mix(LINE, AMBER, glow * 0.55), 1)
+        img.draw_circle(cx - 12, cy - 14, 6,
+                        mix(RAISED, (255, 242, 214), glow * 0.85), -1)
+
+        # filament
+        fil = ((cx - 20, cy + 2), (cx - 12, cy - 7), (cx - 4, cy + 7),
+               (cx + 4, cy - 7), (cx + 12, cy + 7), (cx + 20, cy + 2))
+        fg = mix((65, 55, 43), AMBER_PEAK, glow)
+        for i in range(len(fil) - 1):
+            img.draw_line(fil[i][0], fil[i][1], fil[i + 1][0], fil[i + 1][1],
+                          fg, 2)
+
+        # base
+        neck = mix(PANEL, RAISED, 0.8)
+        img.draw_rect(cx - 15, cy + 34, 30, 7, neck, -1)
+        for i in range(38):
+            y = cy + 41 + i
+            hw = int(15 + i * 0.45)
+            c = mix((25, 28, 34), (48, 52, 61), i / 38.0)
+            img.draw_line(cx - hw, y, cx + hw, y, c, 1)
+        for gy in (cy + 52, cy + 63, cy + 74):
+            img.draw_line(cx - 32, gy, cx + 32, gy, rgb(18, 20, 25), 1)
+        img.draw_line(cx - 31, cy + 79, cx + 31, cy + 79, C_LINE, 1)
+
+    def _draw_stage_readouts(self, stage):
+        img = self.img
+        img.draw_rect(16, 282, 376, 66, C_PANEL_DEEP, -1)
+        img.draw_rect(16, 282, 376, 1, C_LINE, -1)
+        cells = (
+            ("ENV", "%.3f" % self.sim.env, ""),
+            ("LIGHT", "%.1f" % stage, "%"),
+            ("A19 DUTY", "%.1f" % self.sim.a19_duty(), "%"),
+        )
+        for i, (name, value, unit) in enumerate(cells):
+            x = 28 + i * 125
+            text(img, x, 289, name, C_TEXT3, "mono8")
+            text(img, x, 302, value, C_TEXT, "mono20")
+            if unit:
+                text(img, x + text_width(value, "mono20") + 3, 312, unit,
+                     C_TEXT3, "ui9")
+
+    def _draw_controls(self):
+        img = self.img
+        holding = self.sim.holding
+        gate_rgb = (58, 42, 22) if holding else (28, 24, 19)
+        gate_fill = rgb(*gate_rgb)
+        gate_border = C_AMBER if holding else C_AMBER_DIM
+        img.draw_rect(404, 56, 220, 104, gate_fill, -1)
+        img.draw_rect(404, 56, 220, 104, gate_border, 1)
+        text(img, 418, 67, "GATE / KWS", C_TEXT3, "mono8")
+        text(img, 418, 79, "长春", C_TEXT, "ui28")
+        text(img, 418, 116, "chang2 chun1", C_CYAN, "mono10")
+        text(img, 418, 134, "点按模拟 · 说“长春”触发", C_TEXT3, "ui9")
+
+        # small microphone glyph
+        img.draw_circle(584, 88, 14, mix(gate_rgb, AMBER, 0.25), -1)
+        img.draw_circle(584, 88, 14, gate_border, 1)
+        img.draw_rect(581, 81, 6, 11, C_TEXT, -1)
+        img.draw_line(579, 91, 589, 91, C_TEXT, 2)
+        img.draw_line(584, 94, 584, 100, C_TEXT, 1)
+        img.draw_line(579, 101, 589, 101, C_TEXT, 1)
+        if holding:
+            img.draw_circle(584, 88, 20, C_AMBER_DIM, 1)
+            img.draw_circle(584, 88, 26, C_AMBER_DIM, 1)
+
+        # auto demo
+        demo = self.sim.auto_demo
+        demo_fill = rgb(42, 35, 22) if demo else C_PANEL
+        img.draw_rect(404, 170, 220, 42, demo_fill, -1)
+        img.draw_rect(404, 170, 220, 42, C_AMBER_DIM if demo else C_LINE, 1)
+        text(img, 418, 179, "自动演示", C_AMBER if demo else C_TEXT2, "ui12")
+        text(img, 418, 195, "16s 循环 · 2 次门控", C_TEXT3, "ui9")
+        img.draw_circle(604, 191, 6, C_AMBER if demo else C_LINE, -1)
+        if demo:
+            img.draw_circle(604, 191, 3, C_PANEL_DEEP, -1)
+
+        for rect, label in ((RECT_STANDBY, "强制待机"), (RECT_RESET, "重置")):
+            img.draw_rect(rect[0], rect[1], rect[2], rect[3], C_PANEL, -1)
+            img.draw_rect(rect[0], rect[1], rect[2], rect[3], C_LINE, 1)
+            text(img, rect[0] + rect[2] // 2, rect[1] + 12, label,
+                 C_TEXT2, "ui10", align="center")
+
+        # last event card
+        img.draw_rect(404, 268, 220, 80, C_PANEL_DEEP, -1)
+        img.draw_rect(404, 268, 220, 80, C_LINE, 1)
+        text(img, 416, 277, "LAST EVENT", C_TEXT3, "mono8")
+        ev = clip_text(self.sim.last_event, "ui10", 196)
+        text(img, 416, 289, ev, C_TEXT2, "ui10")
+        img.draw_line(416, 307, 612, 307, C_LINE, 1)
+        text(img, 416, 314, format_tick(self.sim.time_s), C_TEXT3, "mono9")
+        text(img, 612, 314, "ENV %.3f" % self.sim.env, C_TEXT3, "mono8",
+             align="right")
+        text(img, 612, 328, "REF %.3f" % self.sim.ref, C_TEXT3, "mono8",
+             align="right")
+
+    # -- timeline ----------------------------------------------------------
+
+    def _draw_timeline(self):
+        img = self.img
+        panel(img, 16, 360, 608, 104, C_PANEL, C_LINE)
+        text(img, 28, 367, "TIMELINE / 10S", C_TEXT2, "mono9")
+        text(img, 612, 367, "LIVE", C_GREEN, "mono8", align="right")
+
+        px, py, pw, ph = 42, 384, 570, 56
+        img.draw_rect(px, py, pw, ph, C_PANEL_DEEP, -1)
+        img.draw_rect(px, py, pw, ph, C_LINE, 1)
+
+        now = self.sim.time_s
+        t0 = now - 10.0
+        hist = self.sim.history
+        if len(hist) > 1:
+            # business state bands
+            for i in range(1, len(hist)):
+                a, b = hist[i - 1], hist[i]
+                if a[3] != "business" and b[3] != "business":
+                    continue
+                x1 = px + int((a[0] - t0) / 10.0 * pw)
+                x2 = px + int((b[0] - t0) / 10.0 * pw)
+                x1 = int(clamp(x1, px, px + pw))
+                x2 = int(clamp(x2, px, px + pw))
+                if x2 > x1:
+                    img.draw_rect(x1, py + 1, max(1, x2 - x1), ph - 2,
+                                  rgb(36, 28, 18), -1)
+            # envelope area
+            for i in range(1, len(hist)):
+                a, b = hist[i - 1], hist[i]
+                if b[0] < t0 - 0.2:
+                    continue
+                x1 = int(clamp(px + (a[0] - t0) / 10.0 * pw, px, px + pw))
+                x2 = int(clamp(px + (b[0] - t0) / 10.0 * pw, px, px + pw))
+                ye = py + ph - int(clamp(a[1], 0.0, 1.0) * ph)
+                if x2 >= x1:
+                    img.draw_line(x1, ye, max(x1, x2), ye, rgb(24, 47, 51), 1)
+                    img.draw_line(x1, ye, x1, py + ph, rgb(18, 36, 39), 1)
+
+        # grid
+        for i in range(5):
+            y = py + int(ph * i / 4)
+            img.draw_line(px, y, px + pw, y, rgb(28, 32, 39), 1)
+        for sec in range(11):
+            x = px + int(pw * sec / 10)
+            img.draw_line(x, py, x, py + ph, rgb(24, 28, 34), 1)
+        text(img, 36, py - 2, "100", C_TEXT3, "mono8", align="right")
+        text(img, 36, py + ph // 2 - 4, "50", C_TEXT3, "mono8", align="right")
+        text(img, 36, py + ph - 8, "0", C_TEXT3, "mono8", align="right")
+
+        # threshold
+        p = self.sim.params
+        ty = py + ph - int(clamp(float(p.light_threshold) / 100.0, 0, 1) * ph)
+        dashed_hline(img, px + 2, px + pw - 2, ty, C_AMBER_DIM, 4, 5)
+
+        # signal lines
+        if len(hist) > 1:
+            for idx, key in ((1, "env"), (2, "light")):
+                last = None
+                for h in hist:
+                    if h[0] < t0 - 0.2:
+                        continue
+                    x = int(clamp(px + (h[0] - t0) / 10.0 * pw, px, px + pw))
+                    v = clamp(h[1] if key == "env" else h[2] / 100.0, 0.0, 1.0)
+                    y = py + ph - int(v * ph)
+                    if last is not None:
+                        color = C_CYAN if key == "env" else C_AMBER
+                        img.draw_line(last[0], last[1], x, y, color,
+                                      1 if key == "env" else 2)
+                    last = (x, y)
+
+        # gate / standby markers
+        for t, kind in self.sim.markers:
+            if t < t0 or t > now:
+                continue
+            x = int(px + (t - t0) / 10.0 * pw)
+            color = C_GREEN if kind == "gate" else C_TEXT3
+            img.draw_line(x, py + 1, x, py + ph - 1, color, 1)
+            img.draw_circle(x, py + 4, 2, color, -1)
+
+        footer = "TH %d%%   WORK -%.1f   RELEASE -%.1f" % (
+            p.light_threshold, p.work_decay, p.release_decay)
+        text(img, 28, 448, footer, C_TEXT3, "mono8")
+        text(img, 612, 448, "%dMS/TICK" % p.decay_tick_ms,
+             C_TEXT3, "mono8", align="right")
+
+    # -- tune --------------------------------------------------------------
+
+    def _draw_tune(self):
+        img = self.img
+        text(img, 24, 58, "参数 / BENCH CONFIG", C_TEXT, "ui16")
+        text(img, 616, 62, "KWS 由后台 voice_pwm 负责", C_TEXT3, "ui9",
+             align="right")
+
+        for key in PARAM_ORDER:
+            self._draw_param_card(key)
+
+        for name, rect in PRESET_RECTS.items():
+            label, code, _ = PRESETS[name]
+            active = self.sim.params.matches(name)
+            fill = rgb(42, 35, 22) if active else C_PANEL
+            border = C_AMBER_DIM if active else C_LINE
+            img.draw_rect(rect[0], rect[1], rect[2], rect[3], fill, -1)
+            img.draw_rect(rect[0], rect[1], rect[2], rect[3], border, 1)
+            text(img, rect[0] + 14, rect[1] + 10, label,
+                 C_AMBER if active else C_TEXT2, "ui12")
+            text(img, rect[0] + rect[2] - 12, rect[1] + 11, code,
+                 C_TEXT3, "mono8", align="right")
+            text(img, rect[0] + 14, rect[1] + 29, "一键套用",
+                 C_TEXT3, "ui9")
+
+        hw_fill = C_PANEL
+        img.draw_rect(16, 378, 608, 54, hw_fill, -1)
+        img.draw_rect(16, 378, 608, 54, C_LINE, 1)
+        text(img, 28, 386, "HARDWARE OUTPUT", C_TEXT3, "mono9")
+        desc = "A18/PWM6 · A19/PWM7 · 18 kHz · 独占"
+        if self.hw_error:
+            desc = clip_text(self.hw_error, "ui9", 470)
+            desc_color = C_RED
+        else:
+            desc_color = C_TEXT2
+        text(img, 28, 400, desc, desc_color, "ui9")
+        text(img, 28, 415, "开启前会检测后台语音应用", C_TEXT3, "ui9")
+
+        btn_fill = rgb(30, 49, 38) if self.hw_on else C_PANEL_DEEP
+        btn_border = C_GREEN if self.hw_on else C_AMBER_DIM
+        img.draw_rect(RECT_HW[0], RECT_HW[1], RECT_HW[2], RECT_HW[3],
+                      btn_fill, -1)
+        img.draw_rect(RECT_HW[0], RECT_HW[1], RECT_HW[2], RECT_HW[3],
+                      btn_border, 1)
+        text(img, RECT_HW[0] + RECT_HW[2] // 2, RECT_HW[1] + 10,
+             "关闭输出" if self.hw_on else "开启输出", btn_border,
+             "ui10", align="center")
+
+        if self.stopped_voice:
+            note = "后台语音已暂停；退出 UI 时会自动恢复。"
+            color = C_AMBER
+        else:
+            note = "KWS 模拟；真实语音门控请运行 voice_pwm.py。"
+            color = C_TEXT3
+        text(img, 24, 442, note, color, "ui9")
+
+    def _draw_param_card(self, key):
+        img = self.img
+        x, y, w, h = PARAM_CARDS[key]
+        label, desc, unit, step, lo, hi = PARAM_DEFS[key]
+        value = self.sim.params.value(key)
+        shown, unit = self.sim.params.format(key)
+        panel(img, x, y, w, h, C_PANEL, C_LINE)
+        text(img, x + 14, y + 11, label, C_TEXT3, "mono9")
+        text(img, x + 14, y + 27, desc, C_TEXT2, "ui10")
+        text(img, x + 14, y + 45, shown, C_AMBER, "mono28")
+        if unit:
+            text(img, x + 18 + text_width(shown, "mono28"), y + 62, unit,
+                 C_TEXT3, "ui9")
+        # range bar
+        t = (float(value) - lo) / float(hi - lo) if hi > lo else 0.0
+        bar_x, bar_y, bar_w = x + 14, y + 85, 150
+        img.draw_rect(bar_x, bar_y, bar_w, 2, C_LINE, -1)
+        img.draw_rect(bar_x, bar_y, int(bar_w * clamp(t, 0, 1)), 2,
+                      C_AMBER_DIM, -1)
+        img.draw_circle(bar_x + int(bar_w * clamp(t, 0, 1)), bar_y + 1,
+                        3, C_AMBER, -1)
+        for direction, bx in ((-1, x + w - 100), (1, x + w - 52)):
+            by = y + h - 42
+            enabled = value > lo if direction < 0 else value < hi
+            fill = C_RAISED if enabled else C_PANEL_DEEP
+            border = C_LINE if enabled else rgb(35, 38, 45)
+            fg = C_TEXT if enabled else C_TEXT3
+            img.draw_rect(bx, by, 40, 32, fill, -1)
+            img.draw_rect(bx, by, 40, 32, border, 1)
+            text(img, bx + 20, by + 5, "−" if direction < 0 else "+",
+                 fg, "ui16", align="center")
+
+    # -- modal -------------------------------------------------------------
+
+    def _draw_modal(self):
+        img = self.img
+        img.draw_rect(0, 44, W, H - 44, C_BG, -1)
+        panel(img, 60, 110, 520, 250, C_PANEL, C_AMBER_DIM)
+        text(img, 84, 132, "后台语音应用正在运行", C_TEXT, "ui20")
+        text(img, 84, 162, "voice_pwm.py 正占用 A18 / A19", C_TEXT2, "ui12")
+        text(img, 84, 188, "测试 UI 需要独占 PWM 才能输出真实灯效。",
+             C_TEXT2, "ui11")
+        img.draw_rect(84, 212, 472, 54, rgb(28, 24, 19), -1)
+        img.draw_rect(84, 212, 472, 54, C_AMBER_DIM, 1)
+        text(img, 96, 222, "停止后台语音并接管 PWM 后，A18/A19 由本页驱动。",
+             C_AMBER, "ui10")
+        text(img, 96, 241, "退出 UI 时会自动恢复后台语音。",
+             C_TEXT3, "ui9")
+
+        img.draw_rect(RECT_MODAL_CANCEL[0], RECT_MODAL_CANCEL[1],
+                      RECT_MODAL_CANCEL[2], RECT_MODAL_CANCEL[3],
+                      C_PANEL_DEEP, -1)
+        img.draw_rect(RECT_MODAL_CANCEL[0], RECT_MODAL_CANCEL[1],
+                      RECT_MODAL_CANCEL[2], RECT_MODAL_CANCEL[3],
+                      C_LINE, 1)
+        text(img, RECT_MODAL_CANCEL[0] + RECT_MODAL_CANCEL[2] // 2,
+             RECT_MODAL_CANCEL[1] + 12, "仅模拟", C_TEXT2, "ui12",
+             align="center")
+
+        img.draw_rect(RECT_MODAL_TAKEOVER[0], RECT_MODAL_TAKEOVER[1],
+                      RECT_MODAL_TAKEOVER[2], RECT_MODAL_TAKEOVER[3],
+                      rgb(58, 42, 22), -1)
+        img.draw_rect(RECT_MODAL_TAKEOVER[0], RECT_MODAL_TAKEOVER[1],
+                      RECT_MODAL_TAKEOVER[2], RECT_MODAL_TAKEOVER[3],
+                      C_AMBER, 1)
+        text(img, RECT_MODAL_TAKEOVER[0] + RECT_MODAL_TAKEOVER[2] // 2,
+             RECT_MODAL_TAKEOVER[1] + 12, "停止并接管", C_AMBER, "ui12",
+             align="center")
+
+        if self.hw_error:
+            text(img, 84, 270, clip_text(self.hw_error, "ui9", 470),
+                 C_RED, "ui9")
+
+    # -- cached layers -----------------------------------------------------
+
+    def prepare(self):
+        if self.prepared:
+            return
+        t0 = time.perf_counter()
+        old_img, old_view, old_modal = self.img, self.view, self.modal
+        self.modal = None
+        self.sim.reset(quiet=True)
+
+        self.bg_bench = self._build_bg("bench")
+        self.bg_tune = self._build_bg("tune")
+
+        modal = image.Image(W, H, image.Format.FMT_RGB888)
+        modal.draw_image(0, 0, self.bg_tune)
+        self.img = modal
+        self.modal = "takeover"
+        self._draw_modal()
+        self.bg_modal = modal
+
+        self.img = old_img
+        self.view = old_view
+        self.modal = old_modal
+        self._build_lamp_frames()
+        self._build_timeline_base()
+        self.sim.reset(quiet=True)
+        self._update_timeline(time.monotonic(), force=True)
+        self.prepared = True
+        print("lamp_ui prepare: %.0f ms" % ((time.perf_counter() - t0) * 1000),
+              flush=True)
+
+    def _build_bg(self, view):
+        canvas = image.Image(W, H, image.Format.FMT_RGB888)
+        canvas.draw_rect(0, 0, W, H, C_BG, -1)
+        self.img = canvas
+        self.view = view
+        self._draw_header()
+        if view == "bench":
+            self._draw_bench()
+            self._erase_bench(canvas)
+        else:
+            self._draw_tune()
+            self._erase_tune(canvas)
+        self._erase_header_dynamic(canvas)
+        return canvas
+
+    def _erase_header_dynamic(self, canvas):
+        canvas.draw_rect(328, 8, 50, 28, C_BG, -1)
+        canvas.draw_rect(380, 8, 108, 28, C_BG, -1)
+        canvas.draw_rect(484, 8, 100, 28, C_BG, -1)
+
+    def _erase_bench(self, canvas):
+        canvas.draw_rect(300, 66, 90, 50, C_PANEL_DEEP, -1)   # hero number
+        canvas.draw_rect(24, 252, 368, 30, C_STAGE, -1)       # state strip
+        canvas.draw_rect(16, 298, 376, 50, C_PANEL_DEEP, -1)  # readout values
+        canvas.draw_rect(414, 286, 200, 58, C_PANEL_DEEP, -1) # event card body
+        canvas.draw_rect(42, 384, 570, 56, C_PANEL_DEEP, -1)  # plot
+        canvas.draw_rect(24, 444, 600, 18, C_PANEL, -1)       # timeline footer
+
+    def _erase_tune(self, canvas):
+        for key in PARAM_ORDER:
+            x, y, w, h = PARAM_CARDS[key]
+            canvas.draw_rect(x + 14, y + 40, 160, 52, C_PANEL, -1)
+        canvas.draw_rect(RECT_HW[0], RECT_HW[1], RECT_HW[2], RECT_HW[3],
+                         C_PANEL, -1)
+        canvas.draw_rect(24, 438, 600, 22, C_BG, -1)
+
+    def _build_lamp_frames(self):
+        old = self.img
+        frames = []
+        px, py, pw, ph = LAMP_PATCH
+        for level in range(0, 101, 5):
+            patch = image.Image(pw, ph, image.Format.FMT_RGB888)
+            patch.draw_rect(0, 0, pw, ph, C_STAGE, -1)
+            for gx in range(28, 381, 32):
+                x = gx - px
+                if 0 <= x < pw:
+                    patch.draw_line(x, 0, x, ph, rgb(26, 30, 37), 1)
+            for gy in range(100, 281, 30):
+                y = gy - py
+                if 0 <= y < ph:
+                    patch.draw_line(0, y, pw, y, rgb(26, 30, 37), 1)
+            self.img = patch
+            self._draw_lamp(186 - px, 186 - py, level)
+            frames.append(patch)
+        self.img = old
+        self.lamp_frames = frames
+
+    def _build_timeline_base(self):
+        img = image.Image(570, 56, image.Format.FMT_RGB888)
+        img.draw_rect(0, 0, 570, 56, C_PANEL_DEEP, -1)
+        for i in range(5):
+            y = int(56 * i / 4)
+            img.draw_line(0, y, 570, y, rgb(28, 32, 39), 1)
+        for sec in range(11):
+            x = int(570 * sec / 10)
+            img.draw_line(x, 0, x, 56, rgb(24, 28, 34), 1)
+        img.draw_rect(0, 0, 570, 56, C_LINE, 1)
+        self.timeline_base = img
+        self.timeline_img = image.Image(570, 56, image.Format.FMT_RGB888)
+
+    def _update_timeline(self, now, force=False):
+        if not self.prepared and not force:
+            return
+        if not force and now - self.last_timeline_update < 0.20:
+            return
+        if self.timeline_base is None:
+            return
+        img = self.timeline_img
+        img.draw_image(0, 0, self.timeline_base)
+        hist = self.sim.history
+        now_s = self.sim.time_s
+        t0 = now_s - 10.0
+
+        # business ribbon at the top; no full-height fill so grid stays legible
+        if hist:
+            run_start = None
+            last_t = None
+            for h in hist:
+                if h[0] < t0 - 0.2:
+                    continue
+                active = h[3] == "business"
+                if active and run_start is None:
+                    run_start = h[0]
+                if not active and run_start is not None:
+                    x1 = int(clamp((run_start - t0) / 10.0 * 570, 0, 569))
+                    x2 = int(clamp((h[0] - t0) / 10.0 * 570, 0, 569))
+                    if x2 > x1:
+                        img.draw_rect(x1, 1, max(1, x2 - x1), 3,
+                                      rgb(58, 42, 22), -1)
+                    run_start = None
+                last_t = h[0]
+            if run_start is not None:
+                x1 = int(clamp((run_start - t0) / 10.0 * 570, 0, 569))
+                img.draw_rect(x1, 1, max(1, 569 - x1), 3,
+                              rgb(58, 42, 22), -1)
+
+        # threshold
+        ty = 56 - int(clamp(float(self.sim.params.light_threshold) / 100.0,
+                            0, 1) * 56)
+        img.draw_line(1, ty, 568, ty, C_AMBER_DIM, 1)
+
+        # decimated curves are plenty for a 570 px timeline
+        use = hist[::3] if len(hist) > 3 else hist
+        for key in ("env", "light"):
+            last = None
+            for h in use:
+                if h[0] < t0 - 0.3:
+                    continue
+                x = int(clamp((h[0] - t0) / 10.0 * 570, 0, 569))
+                v = clamp(h[1] if key == "env" else h[2] / 100.0, 0.0, 1.0)
+                y = 55 - int(v * 54)
+                if last is not None:
+                    c = C_CYAN if key == "env" else C_AMBER
+                    img.draw_line(last[0], last[1], x, y, c,
+                                  1 if key == "env" else 2)
+                last = (x, y)
+
+        for t, kind in self.sim.markers:
+            if t < t0 or t > now_s:
+                continue
+            x = int(clamp((t - t0) / 10.0 * 570, 0, 569))
+            c = C_GREEN if kind == "gate" else C_TEXT3
+            img.draw_line(x, 1, x, 55, c, 1)
+            img.draw_circle(x, 4, 2, c, -1)
+        self.last_timeline_update = now
+
+    def _draw_dynamic_header(self):
+        img = self.img
+        hw_color = C_GREEN if self.hw_on else C_AMBER_DIM
+        img.draw_rect(330, 12, 44, 20, C_PANEL_DEEP, -1)
+        img.draw_rect(330, 12, 44, 20, hw_color, 1)
+        text(img, 352, 15, "HW" if self.hw_on else "SIM", hw_color, "mono9",
+             align="center")
+
+        state = self.sim.state()
+        label, sub, fg, dim = STATE_META[state]
+        fg_c, dim_c = rgb(*fg), rgb(*dim)
+        img.draw_rect(382, 10, 102, 24, C_PANEL_DEEP, -1)
+        img.draw_rect(382, 10, 102, 24, dim_c, 1)
+        img.draw_circle(393, 22, 3, fg_c, -1)
+        text(img, 429, 14, label, fg_c, "ui12", align="center")
+        text(img, 484, 15, format_tick(self.sim.time_s), C_TEXT2, "mono10")
+
+    def _draw_bench_dynamic(self):
+        img = self.img
+        sim = self.sim
+        light = sim.display_light()
+        idx = int(round(clamp(light, 0.0, 100.0) / 5.0))
+        img.draw_image(LAMP_PATCH[0], LAMP_PATCH[1], self.lamp_frames[idx])
+        # the lamp patch starts at x=72, so repaint the small stage caption
+        text(img, 28, 78, "灯效测试台", C_TEXT2, "ui11")
+
+        # state strip
+        img.draw_rect(24, 252, 368, 30, C_STAGE, -1)
+        state = sim.state()
+        label, sub, fg, dim = STATE_META[state]
+        text(img, 28, 260, sub, C_TEXT3, "mono8")
+        text(img, 380, 260, "A19 %.1f HZ" % sim.blink_hz(), C_TEXT3,
+             "mono8", align="right")
+
+        # hero + readouts
+        text(img, 382, 76, "%d%%" % int(round(light)), C_AMBER,
+             "mono28", align="right")
+        img.draw_rect(16, 298, 376, 50, C_PANEL_DEEP, -1)
+        cells = (
+            ("%.3f" % sim.env, ""),
+            ("%.1f" % light, "%"),
+            ("%.1f" % sim.a19_duty(), "%"),
+        )
+        for i, (value, unit) in enumerate(cells):
+            x = 28 + i * 125
+            text(img, x, 302, value, C_TEXT, "mono20")
+            if unit:
+                text(img, x + text_width(value, "mono20") + 3, 312, unit,
+                     C_TEXT3, "ui9")
+
+        # gate / demo highlights
+        gate_color = C_AMBER if (sim.holding or
+                                 (sim.live and sim.voice_active)) else C_AMBER_DIM
+        img.draw_rect(404, 56, 220, 104, gate_color, 1)
+        gate_fill = rgb(58, 42, 22) if sim.holding else rgb(28, 24, 19)
+        live_color = (C_GREEN if (sim.live and sim.live_ready)
+                      else C_AMBER if sim.live else C_TEXT3)
+        img.draw_rect(498, 66, 52, 12, gate_fill, -1)
+        text(img, 500, 67, "LIVE" if sim.live else "SIM", live_color,
+             "mono8")
+        img.draw_circle(560, 72, 3, live_color, -1)
+        img.draw_circle(584, 106, 3, live_color, -1)
+        if sim.holding:
+            img.draw_circle(584, 88, 20, C_AMBER_DIM, 1)
+            img.draw_circle(584, 88, 26, C_AMBER_DIM, 1)
+        demo_color = C_AMBER if sim.auto_demo else C_LINE
+        img.draw_rect(404, 170, 220, 42, demo_color, 1)
+        img.draw_circle(604, 191, 6, C_AMBER if sim.auto_demo else C_LINE, -1)
+        if sim.auto_demo:
+            img.draw_circle(604, 191, 3, C_PANEL_DEEP, -1)
+
+        # event card
+        img.draw_rect(414, 286, 200, 58, C_PANEL_DEEP, -1)
+        ev = clip_text(sim.last_event, "ui10", 196)
+        text(img, 416, 289, ev, C_TEXT2, "ui10")
+        img.draw_line(416, 307, 612, 307, C_LINE, 1)
+        text(img, 416, 314, format_tick(sim.time_s), C_TEXT3, "mono9")
+        text(img, 612, 314, "ENV %.3f" % sim.env, C_TEXT3, "mono8",
+             align="right")
+        text(img, 612, 328, "REF %.3f" % sim.ref, C_TEXT3, "mono8",
+             align="right")
+
+        # timeline + footer
+        img.draw_image(42, 384, self.timeline_img)
+        img.draw_rect(24, 444, 600, 18, C_PANEL, -1)
+        p = sim.params
+        footer = "TH %d%%   WORK -%.1f   RELEASE -%.1f" % (
+            p.light_threshold, p.work_decay, p.release_decay)
+        text(img, 28, 448, footer, C_TEXT3, "mono8")
+        text(img, 612, 448, "%dMS/TICK" % p.decay_tick_ms,
+             C_TEXT3, "mono8", align="right")
+
+    def _draw_tune_dynamic(self):
+        img = self.img
+        p = self.sim.params
+        for key in PARAM_ORDER:
+            x, y, w, h = PARAM_CARDS[key]
+            label, desc, unit, step, lo, hi = PARAM_DEFS[key]
+            value = p.value(key)
+            shown, unit = p.format(key)
+            img.draw_rect(x + 14, y + 40, 160, 52, C_PANEL, -1)
+            text(img, x + 14, y + 45, shown, C_AMBER, "mono28")
+            if unit:
+                text(img, x + 18 + text_width(shown, "mono28"), y + 62, unit,
+                     C_TEXT3, "ui9")
+            t = (float(value) - lo) / float(hi - lo) if hi > lo else 0.0
+            bar_x, bar_y, bar_w = x + 14, y + 85, 150
+            img.draw_rect(bar_x, bar_y, bar_w, 2, C_LINE, -1)
+            img.draw_rect(bar_x, bar_y, int(bar_w * clamp(t, 0, 1)), 2,
+                          C_AMBER_DIM, -1)
+            img.draw_circle(bar_x + int(bar_w * clamp(t, 0, 1)), bar_y + 1,
+                            3, C_AMBER, -1)
+
+        for name, rect in PRESET_RECTS.items():
+            if p.matches(name):
+                img.draw_rect(rect[0], rect[1], rect[2], rect[3],
+                              C_AMBER, 2)
+                break
+
+        btn_fill = rgb(30, 49, 38) if self.hw_on else C_PANEL_DEEP
+        btn_border = C_GREEN if self.hw_on else C_AMBER_DIM
+        img.draw_rect(RECT_HW[0], RECT_HW[1], RECT_HW[2], RECT_HW[3],
+                      btn_fill, -1)
+        img.draw_rect(RECT_HW[0], RECT_HW[1], RECT_HW[2], RECT_HW[3],
+                      btn_border, 1)
+        text(img, RECT_HW[0] + RECT_HW[2] // 2, RECT_HW[1] + 10,
+             "关闭输出" if self.hw_on else "开启输出", btn_border,
+             "ui10", align="center")
+
+        img.draw_rect(24, 438, 600, 22, C_BG, -1)
+        if self.hw_error:
+            note, color = self.hw_error, C_RED
+        elif self.stopped_voice:
+            note, color = "后台语音已暂停；退出 UI 时会自动恢复。", C_AMBER
+        else:
+            note, color = "KWS 模拟；真实语音门控请运行 voice_pwm.py。", C_TEXT3
+        text(img, 24, 442, clip_text(note, "ui9", 590), color, "ui9")
+
+
+# ---------------------------------------------------------------------------
+# preview + live loop
+# ---------------------------------------------------------------------------
+
+def voice_startup_prompt(ui, disp, ts):
+    """The voice app takes most of the 128 MB RAM; ask before stopping it."""
+    if find_voice_app() is None:
+        return True
+    err = ""
+    while not ui.exit_requested:
+        img = ui.img
+        img.draw_rect(0, 0, W, H, C_BG, -1)
+        img.draw_rect(0, 0, W, 2, C_AMBER_DIM, -1)
+        img.draw_rect(16, 18, 24, 24, C_PANEL_DEEP, -1)
+        img.draw_rect(16, 18, 24, 24, C_AMBER_DIM, 1)
+        text(img, 48, 15, "LUMEN", C_TEXT, "ui16")
+        text(img, 100, 18, "/18k", C_AMBER, "ui14")
+        text(img, 48, 34, "VOICE-GATED PWM BENCH", C_TEXT3, "mono8")
+
+        panel(img, 60, 96, 520, 278, C_PANEL, C_AMBER_DIM)
+        text(img, 84, 118, "后台语音正在运行", C_TEXT, "ui20")
+        text(img, 84, 150, "voice_pwm.py 占用大量内存，测试 UI 需要暂停它。",
+             C_TEXT2, "ui11")
+        text(img, 84, 170, "暂停后本页可流畅渲染；退出 UI 时会自动恢复语音。",
+             C_TEXT3, "ui10")
+        img.draw_rect(84, 196, 472, 48, rgb(28, 24, 19), -1)
+        img.draw_rect(84, 196, 472, 48, C_AMBER_DIM, 1)
+        text(img, 96, 208, "不会改动灯控参数或已部署逻辑。",
+             C_AMBER, "ui10")
+        text(img, 96, 224, "停止后 A18/A19 由本 UI 接管输出。",
+             C_TEXT3, "ui9")
+        if err:
+            text(img, 84, 258, clip_text(err, "ui9", 470), C_RED, "ui9")
+
+        img.draw_rect(RECT_MODAL_CANCEL[0], 278, RECT_MODAL_CANCEL[2], 40,
+                      C_PANEL_DEEP, -1)
+        img.draw_rect(RECT_MODAL_CANCEL[0], 278, RECT_MODAL_CANCEL[2], 40,
+                      C_LINE, 1)
+        text(img, RECT_MODAL_CANCEL[0] + RECT_MODAL_CANCEL[2] // 2, 290,
+             "退出", C_TEXT2, "ui12", align="center")
+
+        img.draw_rect(RECT_MODAL_TAKEOVER[0], 278, RECT_MODAL_TAKEOVER[2], 40,
+                      rgb(58, 42, 22), -1)
+        img.draw_rect(RECT_MODAL_TAKEOVER[0], 278, RECT_MODAL_TAKEOVER[2], 40,
+                      C_AMBER, 1)
+        text(img, RECT_MODAL_TAKEOVER[0] + RECT_MODAL_TAKEOVER[2] // 2, 290,
+             "停止并进入", C_AMBER, "ui12", align="center")
+
+        disp.show(img)
+        try:
+            tx, ty, pressed = ts.read()
+        except Exception:
+            tx, ty, pressed = 0, 0, 0
+        if pressed:
+            x, y = ui._map_touch(tx, ty)
+            if inside(x, y, (RECT_MODAL_CANCEL[0], 278,
+                             RECT_MODAL_CANCEL[2], 40)):
+                ui.exit_requested = True
+                return False
+            if inside(x, y, (RECT_MODAL_TAKEOVER[0], 278,
+                             RECT_MODAL_TAKEOVER[2], 40)):
+                ok, msg = stop_voice_app()
+                if ok:
+                    ui.stopped_voice = True
+                    return True
+                err = "停止后台语音失败: %s" % msg
+                print(err, flush=True)
+                time.sleep(0.4)
+        time.sleep(0.05)
+    return False
+
+
+def _preview_state(ui):
+    sim = ui.sim
+    now = 8.32
+    sim.time_s = now
+    sim.phase = "business"
+    sim.env = 0.676
+    sim.env_slow = 0.582
+    sim.ref = 0.820
+    sim.light = 74.2
+    sim.voice_active = True
+    sim.gate_flash_until = -1.0
+    sim.blink_phase = 0.42
+    sim.last_event = "人声出现 · 业务保持"
+    sim.auto_demo = False
+    sim.holding = False
+    sim.history = []
+    for i in range(101):
+        t = now - 10.0 + i * 0.1
+        if t < -1.0:
+            env = 0.0
+            light = breathing_duty(t, 4.0, 5.0, 35.0)
+            phase, voice = "standby", False
+        elif t < -0.3:
+            env = 0.42 * (t + 1.0) / 0.7
+            light = 42.0 + 30.0 * (t + 1.0) / 0.7
+            phase, voice = "business", True
+        elif t < 1.4:
+            env = 0.70 + 0.06 * math.sin(2.0 * math.pi * 2.1 * t)
+            light = max(68.0, business_brightness(min(1.0, env / 0.82)))
+            phase, voice = "business", True
+        elif t < 2.4:
+            env = max(0.0, 0.76 * (1.0 - (t - 1.4) / 1.0))
+            light = max(0.0, 80.0 - 48.0 * (t - 1.4) / 1.0)
+            phase = "business" if light >= 35.0 else "standby"
+            voice = False
+        elif t < 5.0:
+            env = 0.0
+            light = breathing_duty(t, 4.0, 5.0, 35.0)
+            phase, voice = "standby", False
+        elif t < 5.8:
+            env = 0.40 + 0.34 * (t - 5.0) / 0.8
+            light = 42.0 + 30.0 * (t - 5.0) / 0.8
+            phase, voice = "business", True
+        else:
+            env = 0.70 + 0.06 * math.sin(2.0 * math.pi * 2.1 * t)
+            light = max(68.0, business_brightness(min(1.0, env / 0.82)))
+            phase, voice = "business", True
+        sim.history.append((t, env, light, phase, voice))
+    sim.markers = [(-1.0, "gate"), (5.0, "gate")]
+    sim.events = [(-1.0, "GATE", "门控通过 · 长春 · p=0.94"),
+                  (5.0, "GATE", "门控通过 · 长春 · p=0.94")]
+
+
+def touch_test():
+    """Minimal coordinate check; useful when the panel is rotated."""
+    from maix import app, display, touchscreen
+
+    ui = LampUI()
+    disp = display.Display()
+    ts = touchscreen.TouchScreen()
+    last_printed = None
+    while not ui.exit_requested and not app.need_exit():
+        x, y, pressed = 0, 0, 0
+        rx, ry, rp = 0, 0, 0
+        try:
+            x, y, pressed = ts.read()
+            try:
+                rx, ry, rp = ts.read0()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        if pressed and (x, y, pressed) != last_printed:
+            last_printed = (x, y, pressed)
+            print("touch read=(%d,%d,%d) raw0=(%d,%d,%d) map=%s" % (
+                x, y, pressed, rx, ry, rp, ui._map_touch(x, y)), flush=True)
+
+        img = ui.img
+        img.draw_rect(0, 0, W, H, C_BG, -1)
+        img.draw_rect(0, 0, W, 2, C_AMBER_DIM, -1)
+        text(img, 24, 16, "TOUCH TEST / 触摸校准", C_TEXT, "ui16")
+        text(img, 24, 38, "点按屏幕，琥珀色圆点应落在手指下。", C_TEXT2, "ui10")
+        panel(img, 16, 66, 608, 304, C_PANEL, C_LINE)
+        for gx in range(48, 620, 40):
+            img.draw_line(gx, 68, gx, 368, rgb(27, 31, 38), 1)
+        for gy in range(86, 369, 40):
+            img.draw_line(18, gy, 622, gy, rgb(27, 31, 38), 1)
+        cx, cy = 320, 218
+        img.draw_circle(cx, cy, 92, C_LINE, 1)
+        img.draw_circle(cx, cy, 48, C_CYAN_DIM, 1)
+        img.draw_line(cx - 110, cy, cx + 110, cy, C_TEXT3, 1)
+        img.draw_line(cx, cy - 110, cx, cy + 110, C_TEXT3, 1)
+        text(img, cx, cy - 12, "+", C_CYAN, "ui24", align="center")
+        text(img, cx, cy + 18, "CENTER", C_TEXT3, "mono8", align="center")
+
+        text(img, 28, 382, "READ  x=%3d  y=%3d  press=%d" % (x, y, pressed),
+             C_TEXT2, "mono14")
+        text(img, 28, 404, "RAW0  x=%3d  y=%3d  press=%d" % (rx, ry, rp),
+             C_TEXT3, "mono14")
+        mx, my = ui._map_touch(x, y)
+        text(img, 28, 426, "MAP   x=%3d  y=%3d" % (mx, my),
+             C_TEXT3, "mono14")
+        if pressed:
+            px = int(clamp(x, 0, W - 1))
+            py = int(clamp(y, 0, H - 1))
+            img.draw_circle(px, py, 10, C_AMBER, 2)
+            img.draw_circle(px, py, 3, C_AMBER, -1)
+
+        img.draw_rect(RECT_EXIT[0], RECT_EXIT[1], RECT_EXIT[2], RECT_EXIT[3],
+                      C_PANEL_DEEP, -1)
+        img.draw_rect(RECT_EXIT[0], RECT_EXIT[1], RECT_EXIT[2], RECT_EXIT[3],
+                      C_LINE, 1)
+        img.draw_line(601, 16, 613, 28, C_TEXT2, 1)
+        img.draw_line(613, 16, 601, 28, C_TEXT2, 1)
+        text(img, 24, 448, "退出：右上角 X，或 Ctrl+C。方向异常时使用 "
+             "LAMP_UI_TOUCH_SWAP / FLIP_X / FLIP_Y。", C_TEXT3, "ui9")
+        disp.show(img)
+        if pressed:
+            ex, ey = ui._map_touch(x, y)
+            if inside(ex, ey, RECT_EXIT):
+                break
+        time.sleep(0.03)
+
+
+def preview():
+    ui = LampUI()
+    ui.prepare()
+    _preview_state(ui)
+    ui._update_timeline(time.monotonic(), force=True)
+    out = []
+    for view, name in (("bench", "bench"), ("tune", "tune")):
+        ui.view = view
+        ui.modal = None
+        ui.render()
+        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+        path = os.path.join(ARTIFACTS_DIR, "lamp_ui_%s.png" % name)
+        ui.img.save(path)
+        out.append((path, ui.last_render_ms))
+    ui.modal = "takeover"
+    ui.render()
+    path = os.path.join(ARTIFACTS_DIR, "lamp_ui_modal.png")
+    ui.img.save(path)
+    out.append((path, ui.last_render_ms))
+    for path, ms in out:
+        print("%s  render %.1f ms" % (path, ms), flush=True)
+
+
+def parse_live_args(argv):
+    seconds = 0.0
+    auto_demo = False
+    snapshot = ""
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--seconds" and i + 1 < len(argv):
+            seconds = float(argv[i + 1])
+            i += 2
+            continue
+        if arg == "--auto-demo":
+            auto_demo = True
+        elif arg == "--snapshot" and i + 1 < len(argv):
+            snapshot = argv[i + 1]
+            i += 2
+            continue
+        i += 1
+    return seconds, auto_demo, snapshot
+
+
+def main():
+    if "--touch-test" in sys.argv:
+        touch_test()
+        return
+    if "--preview" in sys.argv:
+        preview()
+        return
+
+    seconds, auto_demo, snapshot = parse_live_args(sys.argv[1:])
+    no_live = "--no-live" in sys.argv or "--sim" in sys.argv
+    from maix import app, display, touchscreen
+
+    ui = LampUI()
+    disp = display.Display()
+    ts = touchscreen.TouchScreen()
+
+    if not voice_startup_prompt(ui, disp, ts):
+        print("lamp_ui: cancelled at voice takeover prompt", flush=True)
+        return
+
+    # boot card while the static layers and lamp frames are built
+    boot = image.Image(W, H, image.Format.FMT_RGB888)
+    boot.draw_rect(0, 0, W, H, C_BG, -1)
+    boot.draw_rect(180, 188, 280, 104, C_PANEL, -1)
+    boot.draw_rect(180, 188, 280, 104, C_AMBER_DIM, 1)
+    text(boot, 200, 208, "LUMEN / 18k", C_AMBER, "ui20")
+    text(boot, 200, 240, "正在构建设计层与灯效缓存…", C_TEXT2, "ui10")
+    text(boot, 200, 262, "WARMING UP THE BENCH", C_TEXT3, "mono8")
+    try:
+        disp.show(boot)
+    except Exception:
+        pass
+    ui.prepare()
+    if auto_demo:
+        ui.sim.set_auto_demo(True)
+    elif not no_live:
+        if not ui.start_live():
+            print("lamp_ui: live KWS start failed: %s" % ui.live_error,
+                  flush=True)
+
+    def _stop(_signum, _frame):
+        ui.exit_requested = True
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _stop)
+        except Exception:
+            pass
+
+    start = time.monotonic()
+    last = start
+    try:
+        snap_at = float(os.environ.get("LAMP_UI_SNAPSHOT_AT", "4.0"))
+    except ValueError:
+        snap_at = 4.0
+    snapped = False
+    frames = 0
+    frame_sum = 0.0
+    try:
+        while not ui.exit_requested and not app.need_exit():
+            frame_start = time.monotonic()
+            now = frame_start
+            ui.update(now - last, now)
+            last = now
+            ui.render()
+            disp.show(ui.img)
+            try:
+                tx, ty, pressed = ts.read()
+            except Exception:
+                tx, ty, pressed = 0, 0, 0
+            ui.handle_touch(tx, ty, pressed, now)
+
+            frames += 1
+            frame_sum += time.monotonic() - frame_start
+            if snapshot and not snapped and now - start >= snap_at:
+                try:
+                    ui.img.save(snapshot)
+                    print("snapshot: %s" % snapshot, flush=True)
+                except Exception as exc:
+                    print("snapshot failed: %s" % exc, flush=True)
+                snapped = True
+            if seconds > 0 and now - start >= seconds:
+                break
+            remain = 1.0 / FPS - (time.monotonic() - frame_start)
+            if remain > 0:
+                time.sleep(remain)
+    finally:
+        ui.close()
+        if ui.debug and frames:
+            print("frames %d  avg %.1f ms  render %.1f ms" % (
+                frames, frame_sum * 1000.0 / frames, ui.last_render_ms),
+                flush=True)
+
+
+if __name__ == "__main__":
+    main()

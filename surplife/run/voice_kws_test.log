@@ -1,0 +1,24 @@
+-- [I] [Maix Comm Protocol] auto set pinmap A16 to UART0_TX for uart0
+-- [I] [Maix Comm Protocol] auto set pinmap A17 to UART0_RX for uart0
+-- [I] [Maix Comm Protocol] listening on uart port: uart0(/dev/ttyS0)
+set sample_rate = 16000, real sample_rate = 16000
+max buffer_time:16384000
+set period_size = 4000, real period_size = 4000
+sample point per frame: 4000
+load am vocab ok, vocab_cnt=1250
+-- [I] load cvimodel from: /root/models/am_3332_192_int8.cvimodel
+version: 1.4.0
+cnnctc_3332_192 Build at 2024-09-19 14:14:25 For platform cv181x
+Max SharedMem size:491520
+1970-01-01 00:11:40,851 INFO surplife.voice: 麦克风: surplife_mic (带音量检测)
+kws log 2.048s, len 24
+decoder_kws_init get 1 kws
+  00, chang2 chun1
+1970-01-01 00:11:41,135 INFO surplife.voice: kws 监听中, 关键词: 长春 (chang2 chun1), 门槛 0.10, 音量范围 (-50.0, -10.0) dBFS
+find shared memory(491520),  saved:491520 
+1970-01-01 00:13:11,195 INFO surplife.voice: 检测到 '长春' (p=0.408), 音量 -18.4 dBFS, 得分 79
+1970-01-01 00:13:14,201 INFO surplife.voice: 检测到 '长春' (p=0.124), 音量 -17.3 dBFS, 得分 82
+1970-01-01 00:13:21,950 WARNING surplife.voice: 切换颜色失败: <urlopen error [Errno 111] Connection refused>
+1970-01-01 00:13:22,700 WARNING surplife.voice: 切换颜色失败: <urlopen error [Errno 111] Connection refused>
+1970-01-01 00:15:22,446 INFO surplife.voice: 检测到 '长春' (p=0.647), 音量 -11.1 dBFS, 得分 97
+1970-01-01 00:15:23,201 WARNING surplife.voice: 切换颜色失败: <urlopen error [Errno 111] Connection refused>

@@ -1,0 +1,154 @@
+# voice_pwm — 语音门控 18 kHz PWM 灯控
+
+## 接线 / 输出
+
+| MaixCAM 引脚 | PWM 通道 | sysfs | 用途 |
+|---|---|---|---|
+| A18 | PWM6 | `/sys/class/pwm/pwmchip4/pwm2` | 亮度 |
+| A19 | PWM7 | `/sys/class/pwm/pwmchip4/pwm3` | 闪烁频率给定（默认） |
+
+两路都是 **18 kHz 载波**，占空比 0–100%。
+
+## 运行
+
+```sh
+cd /root/surplife/app
+./run_voice_pwm.sh
+```
+
+默认使用 Maix-Speech KWS（`chang2 chun1`）做“长春”门控；SenseVoice 在这个
+MaixCAM-Pro / 128 MB 板子上不可用。
+
+## 状态机
+
+```text
+待机: A18 慢速呼吸 2% ~ 16%, A19 = 0
+  │
+  │ KWS 概率 >= 0.5 (上升沿, 无时间不应期)
+  ▼
+业务: 3 秒分段斜坡，门控后立即从 100% 开始:
+          0–0.8 s: 100% → 50%
+          0.8–2.0 s: 50% → 35%
+          （以上是同一条三次贝塞尔，先快后慢；2 秒段内按 0.8/1.2 分配）
+          2–3 s: 35% → 16%，线性
+          到达 16% 后从呼吸最大值（16%）进入待机呼吸，不再跳变
+          A18 亮度 = light_level
+          A19 占空 = (light_level - 16%) / 84% * 100%  (PWM7_MODE=freq)
+          闪烁频率 = 1 Hz + 7 Hz * level_slow
+
+      整个衰减过程连续可见，不再由人声包络 hold 住。
+  │
+  │ light_level < LIGHT_THRESHOLD (默认 35%)
+  ▼
+待机
+```
+
+## A19 / 闪烁模式
+
+通过环境变量选择，默认 `freq`：
+
+```sh
+# A19 占空比 = 业务斜坡归一化值 (100%→0), 作为外部驱动的闪烁频率给定 (默认)
+PWM7_MODE=freq ./run_voice_pwm.sh
+
+# A19 完全跟随 A18, 适合两路并联 LED
+PWM7_MODE=mirror ./run_voice_pwm.sh
+
+# A19 按闪烁频率做 0/100% 翻转, 适合 A19 直接驱动第二路灯
+PWM7_MODE=square ./run_voice_pwm.sh
+
+# A19 关闭
+PWM7_MODE=off ./run_voice_pwm.sh
+```
+
+如果希望 **A18 主灯自己** 也做亮-灭翻转：
+
+```sh
+A18_BLINK=1 ./run_voice_pwm.sh
+```
+
+## 无语音演示 / 干跑
+
+```sh
+# 不写 PWM, 只打印状态; 自动 2 s 待机 + 5 s 业务 + 衰减回待机
+PWM_DRY_RUN=1 PWM_DEMO=1 ./run_voice_pwm.sh
+
+# 真正输出 PWM, 自动演示待机/业务/衰减
+PWM_DEMO=1 ./run_voice_pwm.sh
+
+# 端到端诊断: 3 秒后注入一次门控, 观察 100→50(0.8s)→35(1.2s)→16(1s)
+PWM_TEST_GATE_AFTER=3 ./run_voice_pwm.sh
+```
+
+演示结束后进程继续监听语音；按 Ctrl+C 退出，PWM 会被关闭。
+
+## 常用调节
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `VOICE_GATE_THRESHOLD` | 0.5 | “长春”门限 |
+| `VOICE_GATE_REARM` | 0.28 | 概率回落多少后允许下一次触发（无时间不应期） |
+| `STANDBY_MIN/MAX` | 2 / 16 | 待机呼吸占空比范围 |
+| `STANDBY_PERIOD` | 4.0 | 呼吸周期（秒） |
+| `BUSINESS_MIN/MAX` | 40 / 100 | 业务映射范围（实机斜坡从 MAX 到阈值） |
+| `BUSINESS_BEZIER_SECONDS` | 2.0 | 100%→35% 贝塞尔段时长；100→50 占 0.8 s，50→35 占 1.2 s |
+| `BUSINESS_LINEAR_SECONDS` | 1.0 | 35%→16% 线性段时长（秒） |
+| `LIGHT_THRESHOLD` | 35 | 业务第一段终点（35%） |
+| `DECAY_TICK_MS` | 20 | 演示模式“每 tick”的时间长度（毫秒） |
+| `WORK_DECAY_PER_TICK` | 1 | 仅 `PWM_DEMO` 使用 |
+| `RELEASE_DECAY_PER_TICK` | 3 | 仅 `PWM_DEMO` 使用 |
+| `VOICE_ACTIVE_MIN` | 0.01 | 判为人声的最小线性 RMS |
+| `VOICE_ACTIVE_RATIO` | 0.04 | 判为人声的相对门限（× ref） |
+| `BLINK_HZ_MIN/MAX` | 1 / 8 | 闪烁频率范围 |
+| `BLINK_INVERT` | 0 | 设为 1 则声量越大闪得越慢 |
+| `PWM_UPDATE_HZ` | 100 | PWM 更新率 |
+| `PWM_FREQ` | 18000 | 载波频率 |
+
+> `EXIT_RATIO` / `EXIT_HOLD` 已移除；实机业务斜坡为
+> 100%→50%（0.8 s）+ 50%→35%（1.2 s）的三次贝塞尔 + 35%→16%（1 s 线性），
+> 最后从 16% 接回呼吸。
+> 门控仍只认完整的 `chang2 chun1`。
+
+## 降噪 / 音量链
+
+`pwm_mic`（`/root/.asoundrc`）把麦克风 PCM 复制到 FIFO：
+
+```text
+hw:0,0 -> ALSA file 插件 -> /root/surplife/run/surplife_pwm_mic.pcm -> DSP 子进程
+```
+
+DSP 子进程做：
+
+1. 频域高通，削弱 80 Hz 以下风噪/轰鸣；
+2. 慢速噪声谱估计 + 谱减，压环境白噪声；
+3. 150–1200 Hz（含 ang/en/un 鼻韵）人声加权；
+4. 低频能量占比高时判定风噪并进一步压低；
+5. KWS 概率高或处于业务态时降低门限、增强人声并冻结噪声估计；
+6. 20 ms/150 ms 快包络给亮度，100 ms/500 ms 慢包络给闪烁频率。
+
+## 注意
+
+- 旧的 BLE 语音应用 `voice_kws.py` 和本应用不能同时运行：两者都要独占
+  `hw:0,0`，同时启动会有一个打不开麦克风。
+- A18/A19 的 PWM 复用由 MaixPy `pinmap` 设置；如果手动改过引脚复用，重启
+  本应用即可重新设置。
+- 退出时会把两路 duty 置 0 并 `enable=0`，避免灯常亮。
+
+## 进程优先级
+
+`voice_pwm.py` 启动时会调用 `raise_voice_priority()`：
+
+- `nice` 默认 `-10`（需要 root）；
+- `/proc/self/oom_score_adj` 默认 `-800`，降低被 OOM killer 选中的概率；
+- DSP/PWM 子进程通过 fork 继承这两个值。
+
+可通过 `VOICE_NICE`、`VOICE_OOM_SCORE_ADJ` 调整。UI 的 `live_kws.py`
+也会调用同一函数，避免 UI 资源占用高时先杀掉语音识别子进程。
+
+## PWM 初始化注意
+
+刚 export 的 PWM 通道 `period=0` 时，部分内核会拒绝对 `enable` 写 `0`
+并返回 `EINVAL`。`SysfsPwm` 会把这视为“通道本来就是关闭的”，继续写
+`period/duty`，避免 A18 在重启后初始化失败。
+
+A19/PWM7 是辅助通道；它初始化失败时只记录警告，A18/PWM6 仍会继续待机呼吸。

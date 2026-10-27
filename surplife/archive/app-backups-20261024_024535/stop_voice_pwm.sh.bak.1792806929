@@ -1,0 +1,40 @@
+#!/bin/sh
+# 停止 voice_pwm, 并兜底关闭 A18/A19 的 PWM。
+PIDFILE=/root/surplife/pwm.pid
+
+if [ -f "$PIDFILE" ]; then
+    PID="$(cat "$PIDFILE" 2>/dev/null)"
+else
+    PID=""
+fi
+
+if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+    echo "停止 voice_pwm PID=$PID ..."
+    kill -INT "$PID" 2>/dev/null
+    i=0
+    while [ "$i" -lt 30 ]; do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "INT 未退出, 发送 TERM"
+        kill -TERM "$PID" 2>/dev/null
+        sleep 1
+    fi
+else
+    echo "voice_pwm 未运行"
+fi
+
+rm -f "$PIDFILE"
+
+for d in /sys/class/pwm/pwmchip4/pwm2 /sys/class/pwm/pwmchip4/pwm3; do
+    if [ -d "$d" ]; then
+        echo 0 >"$d/duty_cycle" 2>/dev/null || true
+        echo 0 >"$d/enable" 2>/dev/null || true
+    fi
+done
+
+echo "A18/PWM6, A19/PWM7 已关闭"

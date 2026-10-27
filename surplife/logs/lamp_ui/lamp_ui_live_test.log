@@ -1,0 +1,23 @@
+-- [I] [Maix Comm Protocol] auto set pinmap A16 to UART0_TX for uart0
+lamp_ui prepare: 1059 ms
+snapshot: /tmp/lamp_ui_live_kws.png
+-- [I] [Maix Comm Protocol] auto set pinmap A17 to UART0_RX for uart0
+-- [I] [Maix Comm Protocol] listening on uart port: uart0(/dev/ttyS0)
+[SAMPLE_COMM_SNS_ParseIni]-2203: Parse /mnt/data/sensor_cfg.ini
+[parse_source_devnum]-1796: devNum =  1
+[parse_sensor_name]-1877: sensor =  GCORE_GC4653_MIPI_4M_30FPS_10BIT
+[parse_sensor_busid]-1906: bus_id =  4
+[parse_sensor_i2caddr]-1917: sns_i2c_addr =  29
+[parse_sensor_mipidev]-1928: mipi_dev =  0
+[parse_sensor_laneid]-1939: Lane_id =  4, 3, 2, -1, -1
+[parse_sensor_pnswap]-1950: pn_swap =  0, 0, 0, 0, 0
+[parse_sensor_mclken]-1972: mclk_en =  1
+[parse_sensor_mclk]-1983: mclk =  1
+try release sys ok
+[_mmf_init]-1144: maix multi-media version:67a90e2-musl_riscv64
+maix multi-media init ok
+try release vio ok
+try release venc ok
+[SAMPLE_COMM_VO_StartChn]-351: u32Width:480, u32Height:640, u32Square:1
+-- [I] find touch screen device: /dev/input/event1
+maix multi-media driver released.

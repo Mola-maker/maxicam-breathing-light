@@ -1,0 +1,20 @@
+-- [I] [Maix Comm Protocol] auto set pinmap A16 to UART0_TX for uart0
+READY: chang2 chun1 (threshold 0.50, rearm 0.28)
+-- [I] [Maix Comm Protocol] auto set pinmap A17 to UART0_RX for uart0
+-- [I] [Maix Comm Protocol] listening on uart port: uart0(/dev/ttyS0)
+set sample_rate = 16000, real sample_rate = 16000
+max buffer_time:16384000
+set period_size = 4000, real period_size = 4000
+sample point per frame: 4000
+load am vocab ok, vocab_cnt=1250
+-- [I] load cvimodel from: /root/models/am_3332_192_int8.cvimodel
+version: 1.4.0
+cnnctc_3332_192 Build at 2024-09-19 14:14:25 For platform cv181x
+-- [I] exit app by KEY_OK
+-- [I] read key thread exit
+-- [I] [Maix Comm Protocol] exit success
+Max SharedMem size:491520
+kws log 2.048s, len 24
+decoder_kws_init get 1 kws
+  00, chang2 chun1
+pcm dev deinit

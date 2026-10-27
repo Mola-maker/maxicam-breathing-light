@@ -1,0 +1,1205 @@
+#!/usr/bin/env python3
+"""
+MaixCAM Pro 语音门控 18 kHz PWM 灯控
+
+业务:
+    "长春" (chang2 chun1) 是门, 语音模型识别到后从待机进入业务状态。
+    独立音量线程持续监听麦克风, 只做轻量 RMS 包络; 门控后:
+        - 业务态 100% -> 35% -> STANDBY_MAX, 再进入呼吸
+        - A19/PWM7 作为频率给定/方波/mirror 辅助输出
+    门控后从当前 PWM 亮度经 0.1 秒贝塞尔曲线直接升到 100%;
+    之后保持 100%, 直到 env_fast < 本次最大声强的 15% 且持续 0.05 秒;
+    拖音 "un-----" 期间由 en1 拖音评分决定是否继续 100%; 分数低则提前退出;
+    释放后再走 2.3 秒斜坡:
+        100% -> 50% 0.5 秒, 50% -> 35% 0.8 秒 (三次贝塞尔, 先快后慢);
+        35% -> STANDBY_MAX(16%) 1 秒线性;
+        到 16% 后从呼吸最大值进入待机呼吸, 不再跳变。
+
+关键点:
+    nn.Speech.run() 会长时间占用 Python GIL。因此 PWM 控制和音量 DSP
+    都放在独立进程里, 主进程只负责 KWS, 保证 100 Hz 的 PWM 更新不被阻塞。
+
+硬件:
+    A18 -> PWM6 -> /sys/class/pwm/pwmchip4/pwm2
+    A19 -> PWM7 -> /sys/class/pwm/pwmchip4/pwm3
+    载波 18 kHz, duty 0~100%。
+
+环境变量:
+    VOICE_AM_MODEL        KWS 声学模型, 默认 /root/models/am_3332_192_int8.mud
+    VOICE_KEYWORD_PINYIN  关键词拼音, 默认 "chang2 chun1"
+    VOICE_GATE_THRESHOLD  门限概率, 默认 0.5
+    VOICE_GATE_REARM      概率回落到该值以下才重新武装, 默认 0.28 (无时间不应期)
+    VOICE_ALSA_DEVICE     默认 pwm_mic (见 /root/.asoundrc)
+    VOICE_TAP_FIFO        默认 /root/surplife/run/surplife_pwm_mic.pcm
+
+    PWM_FREQ              载波频率, 默认 18000
+    PWM_UPDATE_HZ         PWM 更新率, 默认 100
+    PWM6_PATH / PWM7_PATH sysfs 通道路径
+    PWM7_MODE             freq | mirror | square | off, 默认 freq
+    A18_BLINK             1 = A18 也按闪烁频率做亮灭翻转, 默认 0
+    BLINK_HZ_MIN/MAX      闪烁频率范围, 默认 1 / 8 Hz
+    BLINK_INVERT          1 = 声量越大闪得越慢
+    STANDBY_MIN/MAX       待机呼吸占空比, 默认 2 / 16 %
+    STANDBY_PERIOD        待机呼吸周期, 默认 4 秒
+    BUSINESS_MIN/MAX      业务映射范围 (实机斜坡从 MAX 到阈值), 默认 40 / 100 %
+    BUSINESS_INTRO_SECONDS 门控后当前亮度->INTRO_TARGET 的贝塞尔上升时长, 默认 0.10 秒
+    BUSINESS_INTRO_TARGET 门控上升目标亮度, 默认 100 %
+    BUSINESS_BEZIER_SECONDS 100%->35% 贝塞尔段时长, 默认 1.3 秒 (100->50: 0.5s, 50->35: 0.8s)
+    BUSINESS_LINEAR_SECONDS 35%->STANDBY_MAX 线性段时长, 默认 1.0 秒
+    BUSINESS_HOLD_RATIO  拖音保持释放阈值 (×本次峰值), 默认 0.15
+    BUSINESS_HOLD_RELEASE_SECONDS 低于阈值持续多久后释放, 默认 0.05 秒
+    UN_CANDIDATE         拖音候选词, 默认 en1 (作为第二路 KWS)
+    UN_SCORE_ENABLE      1=启用拖音评分门控, 0=只记录不干预
+    UN_SCORE_MIN_SECONDS 门控后至少观察多久再判断评分, 默认 0.40 秒
+    UN_SCORE_RELEASE     评分低于该值则释放, 默认 0.45
+    UN_MATCH_MIN         候选词匹配概率低于该值则释放, 默认 0.03
+    UN_SCORE_RELEASE_SECONDS 低分持续多久后释放, 默认 0.12 秒
+    LIGHT_THRESHOLD       业务斜坡终点/回待机阈值, 默认 35 %
+    DECAY_TICK_MS         演示模式“每 tick”时长, 默认 20 ms
+    WORK_DECAY_PER_TICK   仅 PWM_DEMO 使用, 默认 1
+    RELEASE_DECAY_PER_TICK 仅 PWM_DEMO 使用, 默认 3
+    VOICE_ACTIVE_MIN      判为人声的最小线性 RMS, 默认 0.01
+    VOICE_ACTIVE_RATIO    判为人声的相对门限, 默认 0.04 * ref
+    MIN_REF               最小人声参考 (线性 RMS), 默认 0.002
+    PWM_DRY_RUN           1 = 只计算不写 PWM
+    PWM_DEMO              1 = 不依赖语音, 自动演示 2s 待机 + 5s 业务 + 衰减
+    SURPLIFE_LOG          日志级别, 默认 INFO
+    VOICE_NICE            语音进程 nice 值, 默认 -10 (需要 root)
+    VOICE_OOM_SCORE_ADJ   语音进程 OOM 分数, 默认 -800 (越低越不容易被杀)
+"""
+
+from __future__ import annotations
+
+import collections
+import errno
+import logging
+import math
+import multiprocessing as mp
+import os
+import signal
+import sys
+import time
+
+log = logging.getLogger("voice_pwm")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def raise_voice_priority() -> None:
+    """提高语音进程调度优先级，并降低被 OOM killer 选中的概率。
+
+    生产 voice_pwm 和 UI 的 live_kws 子进程都会调用；fork 出来的 DSP/PWM
+    子进程会继承 nice 和 oom_score_adj。
+    """
+    target_nice = _env_int("VOICE_NICE", -10)
+    current_nice = None
+    try:
+        current_nice = os.nice(0)
+        if current_nice > target_nice:
+            os.nice(target_nice - current_nice)
+            current_nice = target_nice
+    except OSError as exc:
+        log.warning("设置 nice=%d 失败: %s", target_nice, exc)
+
+    target_oom = _env_int("VOICE_OOM_SCORE_ADJ", -800)
+    actual_oom = None
+    try:
+        with open("/proc/self/oom_score_adj", "w", encoding="ascii") as f:
+            f.write(str(target_oom))
+        with open("/proc/self/oom_score_adj", "r", encoding="ascii") as f:
+            actual_oom = int(f.read().strip())
+    except (OSError, ValueError) as exc:
+        log.warning("设置 oom_score_adj=%d 失败: %s", target_oom, exc)
+
+    log.info("voice priority: nice=%s oom_score_adj=%s", current_nice, actual_oom)
+
+
+# ======================================================================
+# 纯逻辑 (可在没有硬件的机器上测试)
+# ======================================================================
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def breathing_duty(t: float, period: float = 4.0,
+                   lo: float = 2.0, hi: float = 16.0) -> float:
+    """待机慢速呼吸: 从 lo 开始, 在 lo~hi 之间正弦变化。"""
+    phase = 2.0 * math.pi * t / max(period, 0.1) - math.pi / 2.0
+    return lo + (hi - lo) * (0.5 + 0.5 * math.sin(phase))
+
+
+def cubic_bezier_progress(x: float, x1: float, y1: float,
+                          x2: float, y2: float) -> float:
+    """三次贝塞尔缓动: 输入归一化时间 x, 返回归一化进度。"""
+    x = clamp(x, 0.0, 1.0)
+    lo, hi = 0.0, 1.0
+    for _ in range(24):
+        s = (lo + hi) * 0.5
+        u = 1.0 - s
+        xs = 3.0 * u * u * s * x1 + 3.0 * u * s * s * x2 + s ** 3
+        if xs < x:
+            lo = s
+        else:
+            hi = s
+    s = (lo + hi) * 0.5
+    u = 1.0 - s
+    return 3.0 * u * u * s * y1 + 3.0 * u * s * s * y2 + s ** 3
+
+
+BUSINESS_BEZIER_SPLIT = 0.5 / 1.3
+
+
+def business_ramp_progress(x: float) -> float:
+    """
+    业务 100% -> 35% 的三次贝塞尔进度 (先快后慢)。
+
+    归一化时间 x=0.5/1.3 时进度 = (100-50)/(100-35) = 50/65,
+    即默认 1.3 秒段里 0.5 秒到 50%, 剩余 0.8 秒到 35%。
+    控制点 (0.25, 1.0), (0.791567..., 1.0) 是按这个约束选的。
+    """
+    return cubic_bezier_progress(x, 0.25, 1.0, 0.791567089396, 1.0)
+
+
+def intro_ramp_progress(x: float) -> float:
+    """门控上升段: 标准缓入缓出三次贝塞尔。"""
+    return cubic_bezier_progress(x, 0.42, 0.0, 0.58, 1.0)
+
+
+def business_brightness(level: float, lo: float = 40.0, hi: float = 100.0) -> float:
+    """业务亮度: level 0 -> lo, level 1 -> hi, 默认始终高于 35%。"""
+    return lo + (hi - lo) * clamp(level, 0.0, 1.0)
+
+
+def top_fraction_mean(values, fraction: float = 0.30) -> float:
+    """取前 fraction 比例的均值; 用于拖音稳健声强 E_d。"""
+    vals = sorted(values, reverse=True)
+    if not vals:
+        return 0.0
+    k = max(1, int(len(vals) * fraction))
+    return sum(vals[:k]) / k
+
+
+# 拖音评分候选: 当前只实验 en1, 作为同一 KWS 的第二路关键词。
+UN_EXPERIMENT_CANDIDATE = "en1"
+
+
+def un_score_values(ed: float, ek: float, match: float):
+    """I=E_d/E_k, M=候选匹配概率, S=0.6I+0.4M。"""
+    i = clamp(ed / ek, 0.0, 1.0) if ek > 1e-9 else 0.0
+    m = clamp(match, 0.0, 1.0)
+    return i, m, 0.6 * i + 0.4 * m
+
+
+def blink_hz(level: float, lo: float = 1.0, hi: float = 8.0) -> float:
+    """声量越大 -> 闪烁频率越高 (默认)。"""
+    return lo + (hi - lo) * clamp(level, 0.0, 1.0)
+
+
+def decay_step(light: float, target: float, decay_per_tick: float,
+               dt: float, tick_seconds: float) -> float:
+    """
+    非对称包络的单步:
+
+        light -= decay_per_tick * (dt / tick_seconds)
+        if target > light:
+            light = target
+
+    声音变大时 target 直接覆盖当前亮度(快攻); 声音变小时
+    亮度按 decay_per_tick 慢慢下降(慢放)。返回 0~100。
+    """
+    tick_seconds = max(0.001, tick_seconds)
+    decayed = light - max(0.0, decay_per_tick) * (max(0.0, dt) / tick_seconds)
+    if target > decayed:
+        decayed = target
+    return clamp(decayed, 0.0, 100.0)
+
+
+class GateDetector:
+    """
+    只做“上升沿”检测, 不做任何时间不应期。
+    概率超过 threshold 触发一次, 回落到 rearm 以下后才允许下一次。
+    这样同一句 "长春" 不会每帧重复触发, 但用户连续说两次可以立刻响应。
+    """
+
+    def __init__(self, threshold: float = 0.5, rearm: float = 0.28):
+        if rearm >= threshold:
+            raise ValueError("rearm 必须小于 threshold")
+        self.threshold = threshold
+        self.rearm = rearm
+        self.armed = True
+
+    def feed(self, prob: float) -> bool:
+        if prob >= self.threshold:
+            if self.armed:
+                self.armed = False
+                return True
+            return False
+        if prob < self.rearm:
+            self.armed = True
+        return False
+
+
+# ======================================================================
+# 音量 DSP (在子进程里运行, 避免被 nn.Speech 的 GIL 阻塞)
+# ======================================================================
+
+class VoiceEnhancer:
+    """
+    512 点 STFT 的轻量人声增强:
+
+    1. 频域高通: 削弱 80 Hz 以下的风噪/低频轰鸣。
+    2. 谱减: 慢速估计噪声幅度谱, 从当前帧减掉, 抑制环境白噪声。
+    3. 人声频带加权: 150~1200 Hz (元音/ang、en、un 鼻韵) 提升,
+       1200~3500 Hz 适度提升, 5 kHz 以上衰减。
+    4. 风噪检测: 120 Hz 以下能量占比过高时进一步压低低频。
+    5. 与语音模型联动: KWS 概率高或业务态时, 降低噪声门限并额外
+       提升人声频带; 此时冻结噪声估计, 避免把拖音当成噪声学进去。
+    6. 快/慢双包络: 快包络给亮度, 慢包络给闪烁频率。
+    """
+
+    def __init__(self, sample_rate: int = 16000, n_fft: int = 512):
+        import numpy as np
+
+        self.np = np
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.frame_seconds = n_fft / float(sample_rate)
+
+        self.window = np.hanning(n_fft).astype(np.float32)
+        self.window_gain = float(np.sqrt(np.mean(self.window * self.window)))
+        self.freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate).astype(np.float32)
+
+        w = np.ones_like(self.freqs, dtype=np.float32)
+        w[self.freqs < 80.0] = 0.03
+        w[(self.freqs >= 80.0) & (self.freqs < 150.0)] = 0.35
+        w[(self.freqs >= 150.0) & (self.freqs <= 1200.0)] = 1.60
+        w[(self.freqs > 1200.0) & (self.freqs <= 3500.0)] = 1.25
+        w[self.freqs > 5000.0] = 0.50
+        self.band_weight = w
+
+        self.noise_mag = None
+        self.noise_db = -60.0
+        self.env_fast = 0.0
+        self.env_slow = 0.0
+        self.wind = 0.0
+        self.peak_hist = collections.deque()
+
+    def process(self, frame, kws_prob: float, business: float):
+        np = self.np
+        frame = frame.astype(np.float32, copy=False)
+        frame = frame - float(frame.mean())
+
+        x = frame * self.window
+        spectrum = np.fft.rfft(x)
+        mag = np.abs(spectrum).astype(np.float32)
+        power = mag * mag
+        total_power = float(power.sum()) + 1e-12
+
+        frame_rms = float(np.sqrt(np.mean(frame * frame)) + 1e-9)
+        frame_db = 20.0 * math.log10(frame_rms + 1e-9)
+
+        low_ratio = float(power[self.freqs < 120.0].sum()) / total_power
+        voice_hint = (kws_prob > 0.15) or (business > 0.5)
+
+        if self.noise_mag is None:
+            self.noise_mag = np.maximum(mag * 0.25, 1e-6)
+            self.noise_db = frame_db - 6.0
+
+        # 安静时快速学习噪声; 有人声/业务时几乎冻结, 防止把拖音吃掉。
+        if (not voice_hint) and frame_db < self.noise_db + 8.0:
+            self.noise_mag = 0.98 * self.noise_mag + 0.02 * mag
+            self.noise_db = 0.98 * self.noise_db + 0.02 * frame_db
+        else:
+            capped = np.minimum(mag, self.noise_mag * 1.2)
+            self.noise_mag = 0.9995 * self.noise_mag + 0.0005 * capped
+
+        # 谱减
+        clean_mag = np.maximum(mag - 1.6 * self.noise_mag, 0.0)
+
+        # 风噪: 低频占比高时进一步压掉低频, 并记录一个平滑标志。
+        wind_now = 1.0 if (low_ratio > 0.62 and kws_prob < 0.15) else 0.0
+        self.wind = 0.90 * self.wind + 0.10 * wind_now
+        if self.wind > 0.30:
+            clean_mag[self.freqs < 180.0] *= 0.15
+
+        weight = self.band_weight
+        if voice_hint:
+            # 鼻韵/拖音主要能量在 150~1500 Hz, 语音模型在场时再抬一点。
+            weight = weight.copy()
+            band = (self.freqs >= 150.0) & (self.freqs <= 1500.0)
+            weight[band] *= 1.20
+        clean_mag *= weight
+
+        # 用原相位重建, 计算干净信号的 RMS。
+        ratio = clean_mag / (mag + 1e-9)
+        clean = np.fft.irfft(spectrum * ratio, n=self.n_fft)
+        rms = float(np.sqrt(np.mean(clean * clean))) / max(self.window_gain, 1e-6)
+
+        clean_db = 20.0 * math.log10(rms + 1e-9)
+        gate_db = self.noise_db + (3.0 if voice_hint else 6.0)
+        if clean_db < gate_db:
+            rms = 0.0
+        if self.wind > 0.60 and kws_prob < 0.10:
+            rms = 0.0
+
+        # 快包络: 20 ms attack / 150 ms release, 跟住音节和拖音。
+        dt = self.frame_seconds
+        attack_fast = 1.0 - math.exp(-dt / 0.020)
+        release_fast = 1.0 - math.exp(-dt / 0.150)
+        if rms > self.env_fast:
+            self.env_fast += attack_fast * (rms - self.env_fast)
+        else:
+            self.env_fast += release_fast * (rms - self.env_fast)
+
+        # 慢包络: 100 ms attack / 500 ms release, 给闪烁频率, 避免抖动。
+        attack_slow = 1.0 - math.exp(-dt / 0.100)
+        release_slow = 1.0 - math.exp(-dt / 0.500)
+        if rms > self.env_slow:
+            self.env_slow += attack_slow * (rms - self.env_slow)
+        else:
+            self.env_slow += release_slow * (rms - self.env_slow)
+
+        now = time.monotonic()
+        self.peak_hist.append((now, rms))
+        while self.peak_hist and now - self.peak_hist[0][0] > 1.5:
+            self.peak_hist.popleft()
+        peak = max((v for _, v in self.peak_hist), default=0.0)
+
+        return rms, self.env_fast, self.env_slow, peak, self.noise_db, self.wind
+
+
+def _tap_reader(fifo: str, stop_event, env_fast, env_slow, peak_rms,
+                noise_db, wind, kws_prob, business) -> None:
+    """子进程: 从 ALSA file 插件写出的 FIFO 读 PCM, 做降噪和音量包络。"""
+    try:
+        import numpy as np
+        enhancer = VoiceEnhancer()
+    except Exception as exc:  # noqa: BLE001
+        os.write(2, f"[dsp] init failed: {exc}\n".encode())
+        os._exit(2)
+
+    frame_bytes = enhancer.n_fft * 2
+    buf = bytearray()
+
+    while not stop_event.is_set() and os.getppid() != 1:
+        try:
+            with open(fifo, "rb", buffering=0) as f:
+                while not stop_event.is_set() and os.getppid() != 1:
+                    chunk = f.read(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    while len(buf) >= frame_bytes:
+                        raw = bytes(buf[:frame_bytes])
+                        del buf[:frame_bytes]
+                        frame = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                        rms, ef, es, peak, ndb, wnd = enhancer.process(
+                            frame, kws_prob.value, business.value)
+                        env_fast.value = ef
+                        env_slow.value = es
+                        peak_rms.value = peak
+                        noise_db.value = ndb
+                        wind.value = wnd
+        except FileNotFoundError:
+            time.sleep(0.2)
+        except Exception as exc:  # noqa: BLE001
+            os.write(2, f"[dsp] {exc}\n".encode())
+            time.sleep(0.2)
+
+    os._exit(0)
+
+
+class MicTap:
+    """管理音量 DSP 子进程; 必须在 nn.Speech 打开 pwm_mic 之前启动。"""
+
+    def __init__(self, fifo: str, stop_event):
+        self.fifo = fifo
+        ctx = mp.get_context("fork")
+        self.env_fast = ctx.Value("d", 0.0, lock=False)
+        self.env_slow = ctx.Value("d", 0.0, lock=False)
+        self.peak_rms = ctx.Value("d", 0.0, lock=False)
+        self.peak_080 = ctx.Value("d", 0.0, lock=False)
+        self.noise_db = ctx.Value("d", -60.0, lock=False)
+        self.wind = ctx.Value("d", 0.0, lock=False)
+        self.kws_prob = ctx.Value("d", 0.0, lock=False)
+        self.un_prob = ctx.Value("d", 0.0, lock=False)
+        self.un_peak = ctx.Value("d", 0.0, lock=False)
+        self.business = ctx.Value("d", 0.0, lock=False)
+
+        parent = os.path.dirname(fifo)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if os.path.exists(fifo):
+            os.remove(fifo)
+        os.mkfifo(fifo, 0o600)
+        self.proc = ctx.Process(
+            target=_tap_reader_simple,
+            args=(fifo, stop_event, self.env_fast, self.env_slow,
+                  self.peak_rms, self.peak_080, self.noise_db, self.wind,
+                  self.kws_prob, self.business),
+            daemon=True,
+        )
+        self.proc.start()
+
+    def close(self) -> None:
+        if self.proc.is_alive():
+            self.proc.terminate()
+            self.proc.join(1)
+        if os.path.exists(self.fifo):
+            try:
+                os.remove(self.fifo)
+            except OSError:
+                pass
+
+
+# ======================================================================
+# PWM 子进程 (sysfs, 不依赖 maix, 避免下次 fork 破坏多媒体状态)
+# ======================================================================
+
+class SysfsPwm:
+    """直接写 Linux PWM sysfs, 周期单位 ns。"""
+
+    def __init__(self, path: str, period_ns: int, dry_run: bool = False):
+        self.path = path
+        self.period_ns = period_ns
+        self.dry_run = dry_run
+        if not dry_run:
+            self._ensure_export()
+            # 刚 export 的通道 period=0 时，部分内核会拒绝 enable=0
+            # 并返回 EINVAL；这表示通道本来就是关闭的，继续配置即可。
+            try:
+                self._write("enable", 0)
+            except OSError as exc:
+                if exc.errno != errno.EINVAL:
+                    raise
+            self._write("period", self.period_ns)
+            self._write("duty_cycle", 0)
+            self._write("enable", 1)
+
+    def _ensure_export(self) -> None:
+        if os.path.isdir(self.path):
+            return
+        chip = os.path.dirname(self.path)
+        channel = os.path.basename(self.path).replace("pwm", "")
+        try:
+            with open(os.path.join(chip, "export"), "w") as f:
+                f.write(str(channel))
+        except OSError as exc:
+            if exc.errno != errno.EBUSY:
+                raise
+        for _ in range(50):
+            if os.path.isdir(self.path):
+                return
+            time.sleep(0.01)
+        raise RuntimeError(f"PWM export failed: {self.path}")
+
+    def _write(self, name: str, value: int) -> None:
+        with open(os.path.join(self.path, name), "w") as f:
+            f.write(str(value))
+
+    def set_duty(self, percent: float) -> None:
+        if self.dry_run:
+            return
+        percent = clamp(percent, 0.0, 100.0)
+        duty_ns = int(round(self.period_ns * percent / 100.0))
+        self._write("duty_cycle", duty_ns)
+
+    def disable(self) -> None:
+        if self.dry_run:
+            return
+        try:
+            self._write("duty_cycle", 0)
+            self._write("enable", 0)
+        except OSError:
+            pass
+
+
+def _clog(msg: str) -> None:
+    try:
+        os.write(1, f"[pwm {time.strftime('%H:%M:%S')}] {msg}\n".encode())
+    except OSError:
+        pass
+
+
+def _pwm_worker(stop_event, ready_event, gate_seq, env_fast, env_slow, peak_rms,
+                peak_080, un_peak, business, cfg) -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # 这个进程在导入 maix 之前 fork, 只等父进程把 A18/A19 复用成 PWM6/PWM7。
+    if not ready_event.wait(10.0):
+        _clog("pinmap ready timeout")
+        os._exit(2)
+    if stop_event.is_set():
+        os._exit(0)
+
+    try:
+        pwm6 = SysfsPwm(cfg["pwm6_path"], cfg["period_ns"], cfg["dry_run"])
+    except Exception as exc:  # noqa: BLE001
+        _clog(f"A18/PWM6 init failed: {exc}")
+        os._exit(2)
+
+    # A19/PWM7 是闪烁/频率给定辅助通道；它失败不应影响 A18 待机呼吸。
+    pwm7 = None
+    try:
+        pwm7 = SysfsPwm(cfg["pwm7_path"], cfg["period_ns"], cfg["dry_run"])
+    except Exception as exc:  # noqa: BLE001
+        _clog(f"A19/PWM7 init failed, continue with A18 only: {exc}")
+
+    state = "standby"
+    ref = cfg["min_ref"]
+    light_level = 0.0
+    business_start = 0.0
+    hold_active = False
+    hold_peak = cfg["min_ref"]
+    hold_low_since = 0.0
+    intro_active = False
+    intro_start = 0.0
+    intro_from = 0.0
+    intro_target = cfg["business_intro_target"]
+    last_bright = 0.0
+    un_ek = 0.0
+    un_envs = collections.deque(maxlen=500)
+    un_start = 0.0
+    un_score_low_since = 0.0
+    last_gate_seq = gate_seq.value
+    linear_logged = False
+    blink_phase = 0.0
+    start = time.monotonic()
+    breath_start = start
+    last_tick = start
+    last_log = 0.0
+
+    _clog("start, standby breathing on A18/PWM6%s mode=%s" % (
+        ", A19/PWM7" if pwm7 is not None else " (A19 unavailable)", cfg["pwm7_mode"]))
+
+    try:
+        while not stop_event.is_set() and os.getppid() != 1:
+            now = time.monotonic()
+            dt = clamp(now - last_tick, 0.001, 0.10)
+            last_tick = now
+            level = 0.0
+            level_slow = 0.0
+            bright = 0.0
+            hz = cfg["blink_hz_min"]
+            voice_active = False
+
+            if cfg["demo"]:
+                t = now - start
+                tick_s = cfg["decay_tick_ms"] / 1000.0
+                if 2.0 <= t < 7.0:
+                    state = "business"
+                    business.value = 1.0
+                    voice_active = True
+                    level = 0.5 + 0.5 * math.sin(2.0 * math.pi * 0.25 * (t - 2.0))
+                    level_slow = level
+                    ref = 1.0
+                    target = business_brightness(
+                        level, cfg["business_min"], cfg["business_max"])
+                    light_level = decay_step(
+                        light_level, target, cfg["work_decay"], dt, tick_s)
+                    bright = light_level
+                    hz = blink_hz(level_slow, cfg["blink_hz_min"], cfg["blink_hz_max"])
+                    if cfg["blink_invert"]:
+                        hz = cfg["blink_hz_min"] + cfg["blink_hz_max"] - hz
+                elif 7.0 <= t and state == "business":
+                    business.value = 1.0
+                    voice_active = False
+                    level = 0.0
+                    level_slow = 0.0
+                    light_level = decay_step(
+                        light_level, 0.0, cfg["release_decay"], dt, tick_s)
+                    bright = light_level
+                    hz = blink_hz(0.0, cfg["blink_hz_min"], cfg["blink_hz_max"])
+                    if light_level < cfg["light_threshold"]:
+                        state = "standby"
+                        business.value = 0.0
+                        light_level = 0.0
+                        bright = breathing_duty(t, cfg["standby_period"],
+                                                cfg["standby_min"], cfg["standby_max"])
+                else:
+                    if state == "business":
+                        business.value = 0.0
+                    state = "standby"
+                    light_level = 0.0
+                    bright = breathing_duty(t, cfg["standby_period"],
+                                            cfg["standby_min"], cfg["standby_max"])
+            else:
+                if gate_seq.value != last_gate_seq:
+                    last_gate_seq = gate_seq.value
+                    state = "business"
+                    business_start = now
+                    linear_logged = False
+                    hold_peak = ref = max(
+                        peak_rms.value, env_fast.value, cfg["min_ref"])
+                    hold_low_since = 0.0
+                    un_ek = peak_080.value
+                    un_envs.clear()
+                    un_start = now
+                    un_score_low_since = 0.0
+                    blink_phase = 0.0
+                    business.value = 1.0
+                    top = cfg["business_max"]
+                    intro_start = now
+                    intro_from = clamp(last_bright, 0.0, top)
+                    intro_target = clamp(cfg["business_intro_target"],
+                                         0.0, top)
+                    intro_s = cfg["business_intro_seconds"]
+                    if intro_from < intro_target and intro_s > 0.0:
+                        intro_active = True
+                        hold_active = False
+                        light_level = intro_from
+                        intro_log = (f"fade {intro_from:.0f}%->"
+                                     f"{intro_target:.0f}% "
+                                     f"{intro_s:.2f}s bezier")
+                        if intro_target < top:
+                            intro_log += f", jump {top:.0f}%"
+                    else:
+                        intro_active = False
+                        hold_active = True
+                        light_level = top
+                        intro_log = f"jump {top:.0f}%"
+                    _clog(f"GATE -> business, {intro_log}, hold 100% until "
+                          f"env < {cfg['business_hold_ratio']*100:.0f}% peak "
+                          f"for {cfg['business_hold_release_seconds']:.2f}s; "
+                          f"then {top:.0f}% -> "
+                          f"{cfg['light_threshold']:.0f}% in "
+                          f"{cfg['business_bezier_seconds']:.2f}s bezier + "
+                          f"{cfg['standby_max']:.0f}% in "
+                          f"{cfg['business_linear_seconds']:.1f}s linear "
+                          f"(ref={ref:.4f})")
+
+                if state == "standby":
+                    bright = breathing_duty(now - breath_start,
+                                            cfg["standby_period"],
+                                            cfg["standby_min"], cfg["standby_max"])
+                else:
+                    env = env_fast.value
+                    voice_floor = max(cfg["voice_active_min"],
+                                      cfg["voice_active_ratio"] * ref)
+                    voice_active = env >= voice_floor
+                    if intro_active or hold_active:
+                        un_envs.append(env)
+
+                    top = cfg["business_max"]
+                    mid = cfg["light_threshold"]
+                    end = cfg["standby_max"]
+                    bezier_s = cfg["business_bezier_seconds"]
+                    linear_s = cfg["business_linear_seconds"]
+
+                    if intro_active:
+                        hold_peak = max(hold_peak, env)
+                        elapsed_intro = now - intro_start
+                        if elapsed_intro < cfg["business_intro_seconds"]:
+                            x = elapsed_intro / max(
+                                cfg["business_intro_seconds"], 1e-6)
+                            light_level = intro_from + (
+                                intro_target - intro_from
+                            ) * intro_ramp_progress(x)
+                        else:
+                            intro_active = False
+                            hold_active = True
+                            hold_low_since = 0.0
+                            light_level = top
+                            suffix = (f", jump {top:.0f}%"
+                                      if intro_target < top else "")
+                            _clog(f"INTRO done{suffix} "
+                                  f"(from {intro_from:.0f}%, "
+                                  f"target {intro_target:.0f}%)")
+                    else:
+                        if (hold_active and cfg["un_score_enable"]
+                                and now - un_start >= cfg["un_score_min_seconds"]):
+                            ed_now = top_fraction_mean(un_envs, 0.30)
+                            i_now, m_now, s_now = un_score_values(
+                                ed_now, un_ek, un_peak.value)
+                            score_low = (s_now < cfg["un_score_release"]
+                                         or m_now < cfg["un_match_min"])
+                            if score_low:
+                                if un_score_low_since <= 0.0:
+                                    un_score_low_since = now
+                                elif (now - un_score_low_since
+                                      >= cfg["un_score_release_seconds"]):
+                                    hold_active = False
+                                    hold_low_since = 0.0
+                                    un_score_low_since = 0.0
+                                    business_start = now
+                                    linear_logged = False
+                                    ratio = (ed_now / un_ek
+                                             if un_ek > 1e-9 else 0.0)
+                                    _clog(f"UNSCORE release S={s_now:.3f} "
+                                          f"< {cfg['un_score_release']:.2f} "
+                                          f"or M={m_now:.3f} < "
+                                          f"{cfg['un_match_min']:.2f}; "
+                                          f"I={i_now:.3f} ek={un_ek:.4f} "
+                                          f"ed={ed_now:.4f} "
+                                          f"dur={now - un_start:.2f}s")
+                                    _clog(f"UNMEASURE cand="
+                                          f"{cfg['un_candidate']} "
+                                          f"ek={un_ek:.4f} ed={ed_now:.4f} "
+                                          f"ratio={ratio:.3f} "
+                                          f"I={i_now:.3f} M={m_now:.3f} "
+                                          f"S={s_now:.3f} "
+                                          f"dur={now - un_start:.2f}s "
+                                          f"frames={len(un_envs)}")
+                                    un_envs.clear()
+                            else:
+                                un_score_low_since = 0.0
+
+                        if hold_active:
+                            hold_peak = max(hold_peak, env)
+                            hold_floor = max(cfg["voice_active_min"],
+                                             cfg["business_hold_ratio"] * hold_peak)
+                            if env < hold_floor:
+                                if hold_low_since <= 0.0:
+                                    hold_low_since = now
+                                elif (now - hold_low_since
+                                      >= cfg["business_hold_release_seconds"]):
+                                    hold_active = False
+                                    hold_low_since = 0.0
+                                    business_start = now
+                                    linear_logged = False
+                                    ed = top_fraction_mean(un_envs, 0.30)
+                                    ratio = ed / un_ek if un_ek > 1e-9 else 0.0
+                                    i_now, m_now, s_now = un_score_values(
+                                        ed, un_ek, un_peak.value)
+                                    _clog(f"HOLD release, env={env:.4f} < "
+                                          f"{hold_floor:.4f} "
+                                          f"(peak={hold_peak:.4f}), start "
+                                          f"{top:.0f}%->{end:.0f}% "
+                                          f"{bezier_s + linear_s:.1f}s")
+                                    _clog(f"UNMEASURE cand="
+                                          f"{cfg['un_candidate']} "
+                                          f"ek={un_ek:.4f} ed={ed:.4f} "
+                                          f"ratio={ratio:.3f} "
+                                          f"I={i_now:.3f} M={m_now:.3f} "
+                                          f"S={s_now:.3f} "
+                                          f"dur={now - un_start:.2f}s "
+                                          f"frames={len(un_envs)}")
+                                    un_envs.clear()
+                            else:
+                                hold_low_since = 0.0
+
+                        if hold_active:
+                            light_level = top
+                        else:
+                            elapsed_business = max(0.0, now - business_start)
+                            if elapsed_business < bezier_s:
+                                x = elapsed_business / bezier_s
+                                light_level = top - (top - mid) * business_ramp_progress(x)
+                            elif elapsed_business < bezier_s + linear_s:
+                                if not linear_logged:
+                                    linear_logged = True
+                                    _clog(f"business {mid:.0f}% -> {end:.0f}% "
+                                          f"linear {linear_s:.1f}s")
+                                x = (elapsed_business - bezier_s) / linear_s
+                                light_level = mid - (mid - end) * clamp(x, 0.0, 1.0)
+                            else:
+                                _clog(f"EXIT -> standby, handoff={end:.0f}% "
+                                      f"elapsed={elapsed_business:.2f}s "
+                                      f"env={env:.4f} ref={ref:.4f} "
+                                      f"voice_active={int(voice_active)}")
+                                state = "standby"
+                                hold_active = False
+                                intro_active = False
+                                hold_low_since = 0.0
+                                business.value = 0.0
+                                ref = cfg["min_ref"]
+                                light_level = 0.0
+                                # 呼吸在 16% 峰值处接上: 相位 pi/2 对应 hi。
+                                breath_start = now - cfg["standby_period"] / 2.0
+                                bright = breathing_duty(
+                                    now - breath_start, cfg["standby_period"],
+                                    cfg["standby_min"], cfg["standby_max"])
+
+                    if state == "business":
+                        bright = light_level
+                        span = max(1.0, top - end)
+                        level_slow = clamp((light_level - end) / span, 0.0, 1.0)
+                        level = level_slow
+                        hz = blink_hz(level_slow, cfg["blink_hz_min"],
+                                      cfg["blink_hz_max"])
+                        if cfg["blink_invert"]:
+                            hz = (cfg["blink_hz_min"] + cfg["blink_hz_max"]
+                                  - hz)
+
+            # 闪烁相位
+            blink_phase += hz * dt
+            if blink_phase >= 1.0:
+                blink_phase -= math.floor(blink_phase)
+            blink_on = blink_phase < 0.5
+            in_business = (state == "business")
+
+            duty6 = bright
+            if in_business and cfg["a18_blink"] and not blink_on:
+                duty6 = 0.0
+
+            mode = cfg["pwm7_mode"]
+            if not in_business:
+                duty7 = duty6 if mode == "mirror" else 0.0
+            elif mode == "mirror":
+                duty7 = bright if (not cfg["a18_blink"] or blink_on) else 0.0
+            elif mode == "freq":
+                duty7 = level_slow * 100.0
+            elif mode == "square":
+                duty7 = 100.0 if blink_on else 0.0
+            else:  # off
+                duty7 = 0.0
+
+            pwm6.set_duty(duty6)
+            last_bright = bright
+            if pwm7 is not None:
+                pwm7.set_duty(duty7)
+
+            if now - last_log >= 1.0:
+                last_log = now
+                if in_business:
+                    _clog(f"business level={level:.2f}/{level_slow:.2f} "
+                          f"env={env_fast.value:.4f} light={light_level:.0f}% "
+                          f"hold={int(hold_active)} intro={int(intro_active)} "
+                          f"voice={int(voice_active)} "
+                          f"bright={duty6:.0f}% hz={hz:.1f} A19={duty7:.0f}%")
+                else:
+                    _clog(f"standby breath={duty6:.1f}% raw_env={env_fast.value:.4f}")
+
+            elapsed = time.monotonic() - now
+            time.sleep(max(0.0, 1.0 / cfg["update_hz"] - elapsed))
+    finally:
+        try:
+            pwm6.set_duty(0)
+            pwm6.disable()
+        except Exception:  # noqa: BLE001
+            pass
+        if pwm7 is not None:
+            try:
+                pwm7.set_duty(0)
+                pwm7.disable()
+            except Exception:  # noqa: BLE001
+                pass
+        _clog("stopped, PWM off")
+        os._exit(0)
+
+
+def _pwm_off(path: str) -> None:
+    """父进程兜底关闭 PWM, 防止子进程被 SIGKILL 后灯常亮。"""
+    for name, value in (("duty_cycle", 0), ("enable", 0)):
+        try:
+            with open(os.path.join(path, name), "w") as f:
+                f.write(str(value))
+        except OSError:
+            pass
+
+
+# ======================================================================
+# 配置与主进程
+# ======================================================================
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def build_config() -> dict:
+    freq = max(1, _env_int("PWM_FREQ", 18000))
+    mode = os.environ.get("PWM7_MODE", "freq").strip().lower()
+    if mode not in ("freq", "mirror", "square", "off"):
+        mode = "freq"
+    gate_threshold = _env_float("VOICE_GATE_THRESHOLD", 0.5)
+    gate_rearm = _env_float("VOICE_GATE_REARM", 0.28)
+    if gate_rearm >= gate_threshold:
+        gate_rearm = gate_threshold * 0.5
+
+    light_threshold = clamp(_env_float("LIGHT_THRESHOLD", 35.0), 0.0, 99.0)
+    business_min = max(_env_float("BUSINESS_MIN", 40.0), light_threshold + 1.0)
+    business_max = clamp(_env_float("BUSINESS_MAX", 100.0), business_min, 100.0)
+
+    return {
+        "model": os.environ.get("VOICE_AM_MODEL", "/root/models/am_3332_192_int8.mud"),
+        "keyword_pinyin": os.environ.get("VOICE_KEYWORD_PINYIN", "chang2 chun1"),
+        "gate_threshold": gate_threshold,
+        "gate_rearm": gate_rearm,
+        "alsa_device": os.environ.get("VOICE_ALSA_DEVICE", "surplife_mic"),
+        "fifo": os.environ.get("VOICE_TAP_FIFO", "/root/surplife/run/surplife_mic.pcm"),
+        "pwm6_path": os.environ.get("PWM6_PATH", "/sys/class/pwm/pwmchip4/pwm2"),
+        "pwm7_path": os.environ.get("PWM7_PATH", "/sys/class/pwm/pwmchip4/pwm3"),
+        "period_ns": int(1_000_000_000 / freq),
+        "update_hz": clamp(_env_int("PWM_UPDATE_HZ", 100), 20, 200),
+        "pwm7_mode": mode,
+        "a18_blink": _env_bool("A18_BLINK", False),
+        "blink_hz_min": _env_float("BLINK_HZ_MIN", 1.0),
+        "blink_hz_max": _env_float("BLINK_HZ_MAX", 8.0),
+        "blink_invert": _env_bool("BLINK_INVERT", False),
+        "standby_min": _env_float("STANDBY_MIN", 2.0),
+        "standby_max": _env_float("STANDBY_MAX", 16.0),
+        "standby_period": _env_float("STANDBY_PERIOD", 4.0),
+        "business_min": business_min,
+        "business_max": business_max,
+        "business_intro_seconds": clamp(
+            _env_float("BUSINESS_INTRO_SECONDS", 0.1), 0.0, 10.0),
+        "business_intro_target": clamp(
+            _env_float("BUSINESS_INTRO_TARGET", 100.0), 0.0, 100.0),
+        "business_bezier_seconds": clamp(
+            _env_float("BUSINESS_BEZIER_SECONDS", 1.3), 0.05, 60.0),
+        "business_linear_seconds": clamp(
+            _env_float("BUSINESS_LINEAR_SECONDS", 1.0), 0.05, 60.0),
+        "business_hold_ratio": clamp(
+            _env_float("BUSINESS_HOLD_RATIO", 0.15), 0.01, 0.95),
+        "business_hold_release_seconds": clamp(
+            _env_float("BUSINESS_HOLD_RELEASE_SECONDS", 0.05), 0.0, 10.0),
+        "light_threshold": light_threshold,
+        "decay_tick_ms": clamp(_env_float("DECAY_TICK_MS", 20.0), 1.0, 1000.0),
+        "work_decay": max(0.0, _env_float("WORK_DECAY_PER_TICK", 1.0)),
+        "release_decay": max(0.0, _env_float("RELEASE_DECAY_PER_TICK", 3.0)),
+        "voice_active_min": max(0.0, _env_float("VOICE_ACTIVE_MIN", 0.01)),
+        "voice_active_ratio": max(0.0, _env_float("VOICE_ACTIVE_RATIO", 0.04)),
+        "min_ref": _env_float("MIN_REF", 0.002),
+        "dry_run": _env_bool("PWM_DRY_RUN", False),
+        "demo": _env_bool("PWM_DEMO", False),
+        "kws_debug": _env_bool("VOICE_KWS_DEBUG", False),
+        # 拖音评分: 候选 en1 走 KWS 第二路; 评分低时提前退出 100%。
+        "un_candidate": (os.environ.get("UN_CANDIDATE")
+                         or UN_EXPERIMENT_CANDIDATE).strip(),
+        "un_score_enable": _env_bool("UN_SCORE_ENABLE", True),
+        "un_score_min_seconds": clamp(
+            _env_float("UN_SCORE_MIN_SECONDS", 0.40), 0.0, 10.0),
+        "un_score_release": clamp(
+            _env_float("UN_SCORE_RELEASE", 0.45), 0.0, 1.0),
+        "un_match_min": clamp(
+            _env_float("UN_MATCH_MIN", 0.03), 0.0, 1.0),
+        "un_score_release_seconds": clamp(
+            _env_float("UN_SCORE_RELEASE_SECONDS", 0.12), 0.0, 10.0),
+        # 仅用于无真人说话时的端到端诊断: N 秒后注入一次门控事件。
+        "test_gate_after": _env_float("PWM_TEST_GATE_AFTER", 0.0),
+    }
+
+
+
+def _tap_reader_simple(fifo, stop_event, env_fast, env_slow, peak_rms,
+                       peak_080, noise_db, wind, kws_prob, business):
+    """轻量音量包络: 只算 RMS, 不做 FFT/谱减, 避免和 KWS 抢 CPU。"""
+    import array
+    peak_hist = collections.deque()
+    envf = 0.0
+    envs = 0.0
+    while not stop_event.is_set() and os.getppid() != 1:
+        try:
+            with open(fifo, "rb", buffering=0) as f:
+                while not stop_event.is_set() and os.getppid() != 1:
+                    chunk = f.read(1024)
+                    if not chunk:
+                        break
+                    chunk = chunk[:len(chunk) // 2 * 2]
+                    samples = array.array("h", chunk)
+                    if not samples:
+                        continue
+                    rms = math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768.0
+                    dt = len(samples) / 16000.0
+                    a_fast = 1.0 - math.exp(-dt / 0.020)
+                    r_fast = 1.0 - math.exp(-dt / 0.080)
+                    if rms > envf:
+                        envf += a_fast * (rms - envf)
+                    else:
+                        envf += r_fast * (rms - envf)
+                    a_slow = 1.0 - math.exp(-dt / 0.100)
+                    r_slow = 1.0 - math.exp(-dt / 0.500)
+                    if rms > envs:
+                        envs += a_slow * (rms - envs)
+                    else:
+                        envs += r_slow * (rms - envs)
+                    now = time.monotonic()
+                    peak_hist.append((now, rms))
+                    while peak_hist and now - peak_hist[0][0] > 1.5:
+                        peak_hist.popleft()
+                    peak = max((v for _, v in peak_hist), default=0.0)
+                    p080 = max((v for t, v in peak_hist
+                                if now - t <= 0.8), default=0.0)
+                    env_fast.value = envf
+                    env_slow.value = envs
+                    peak_rms.value = peak
+                    peak_080.value = p080
+                    noise_db.value = -60.0
+                    wind.value = 0.0
+        except FileNotFoundError:
+            time.sleep(0.2)
+        except Exception as exc:
+            os.write(2, f"[dsp-simple] {exc}\n".encode())
+            time.sleep(0.2)
+    os._exit(0)
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=os.environ.get("SURPLIFE_LOG", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    raise_voice_priority()
+    cfg = build_config()
+    log.info("config: model=%s alsa=%s pwm=%d Hz update=%d Hz mode=%s dry=%s demo=%s",
+             cfg["model"], cfg["alsa_device"], 1_000_000_000 // cfg["period_ns"],
+             cfg["update_hz"], cfg["pwm7_mode"], cfg["dry_run"], cfg["demo"])
+    bezier_s = cfg["business_bezier_seconds"]
+    jump_note = (f", jump {cfg['business_max']:.0f}%"
+                 if cfg["business_intro_target"] < cfg["business_max"] else "")
+    log.info("ramp: start->%.0f%% %.2fs bezier%s; "
+             "hold 100%% until env < %.0f%% peak for %.2fs; "
+             "then 100%% -> 50%% %.2fs / 50%% -> %.0f%% %.2fs "
+             "cubic-bezier + %.0f%% -> %.0f%% %.1fs linear; "
+             "standby_max=%.0f%%",
+             cfg["business_intro_target"], cfg["business_intro_seconds"],
+             jump_note,
+             cfg["business_hold_ratio"] * 100,
+             cfg["business_hold_release_seconds"],
+             bezier_s * BUSINESS_BEZIER_SPLIT,
+             cfg["light_threshold"],
+             bezier_s * (1.0 - BUSINESS_BEZIER_SPLIT),
+             cfg["light_threshold"], cfg["standby_max"],
+             cfg["business_linear_seconds"], cfg["standby_max"])
+    log.info("un score %s: cand=%s via KWS #2, I=ed/ek, M=match peak, "
+             "S=0.6I+0.4M; release if S<%.2f or M<%.2f after %.2fs "
+             "(debounce %.2fs)",
+             "ENABLED" if cfg["un_score_enable"] else "SHADOW",
+             cfg["un_candidate"], cfg["un_score_release"],
+             cfg["un_match_min"], cfg["un_score_min_seconds"],
+             cfg["un_score_release_seconds"])
+
+    ctx = mp.get_context("fork")
+    stop_event = ctx.Event()
+    gate_seq = ctx.Value("i", 0, lock=False)
+
+    # 1) 先 fork 音量 DSP, 此时还没有导入 maix, 避免把多媒体状态带进子进程。
+    tap = MicTap(cfg["fifo"], stop_event)
+
+    # 2) 再 fork PWM 子进程; 它只写 sysfs, 等父进程设置好 A18/A19 复用后再启动。
+    #    这样它不会继承 maix/多媒体状态, 在 128 MB 内存的板子上更省。
+    pwm_ready = ctx.Event()
+    pwm_proc = ctx.Process(
+        target=_pwm_worker,
+        args=(stop_event, pwm_ready, gate_seq, tap.env_fast, tap.env_slow,
+              tap.peak_rms, tap.peak_080, tap.un_peak, tap.business, cfg),
+        daemon=True,
+    )
+    pwm_proc.start()
+
+    speech = None
+    try:
+        # 3) 父进程导入 maix, 设置 A18/A19 的 PWM 复用功能。
+        from maix import app, err, nn, pinmap
+
+        if _env_bool("SKIP_PINMAP", False):
+            log.info("pinmap skipped by SKIP_PINMAP")
+        else:
+            for pin, func in (("A18", "PWM6"), ("A19", "PWM7")):
+                ret = pinmap.set_pin_function(pin, func)
+                if ret != err.Err.ERR_NONE:
+                    log.warning("pinmap %s -> %s failed: %s", pin, func, ret)
+                else:
+                    log.info("pinmap %s -> %s ok", pin, func)
+        pwm_ready.set()
+
+        speech = nn.Speech(cfg["model"])
+        ret = speech.init(nn.SpeechDevice.DEVICE_MIC, cfg["alsa_device"])
+        if ret != err.Err.ERR_NONE:
+            log.error("打开 ALSA 设备 %s 失败: %s", cfg["alsa_device"], ret)
+            return 1
+
+        gate = GateDetector(cfg["gate_threshold"], cfg["gate_rearm"])
+        last_prob_log = 0.0
+        un_peak = 0.0
+
+        def callback(data, length):
+            nonlocal last_prob_log, un_peak
+            if length < 1:
+                return
+            try:
+                prob = float(data[0])
+            except (TypeError, ValueError):
+                return
+            un_prob = 0.0
+            if len(data) > 1:
+                try:
+                    un_prob = float(data[1])
+                except (TypeError, ValueError):
+                    un_prob = 0.0
+            tap.kws_prob.value = prob
+            tap.un_prob.value = un_prob
+            if cfg["kws_debug"]:
+                now = time.monotonic()
+                if ((prob >= 0.02 or un_prob >= 0.02)
+                        and now - last_prob_log >= 0.2):
+                    log.info("KWS p=%.3f %s=%.3f",
+                             prob, cfg["un_candidate"], un_prob)
+                    last_prob_log = now
+            if gate.feed(prob):
+                un_peak = 0.0
+                tap.un_peak.value = 0.0
+                gate_seq.value = gate_seq.value + 1
+                log.info("GATE: '%s' p=%.3f", cfg["keyword_pinyin"], prob)
+            if un_prob > un_peak:
+                un_peak = un_prob
+                tap.un_peak.value = un_peak
+
+        speech.kws([cfg["keyword_pinyin"], cfg["un_candidate"]],
+                   [0.1, 0.1], callback, True)
+        log.info("监听中: %s + %s (门限 %.2f, 回武装 %.2f, 无时间不应期)",
+                 cfg["keyword_pinyin"], cfg["un_candidate"],
+                 cfg["gate_threshold"], cfg["gate_rearm"])
+
+        loop_start = time.monotonic()
+        test_gate_sent = False
+        while not app.need_exit():
+            if not pwm_proc.is_alive():
+                log.error("PWM 子进程退出")
+                break
+            if not tap.proc.is_alive():
+                log.error("音量 DSP 子进程退出")
+                break
+            if (cfg["test_gate_after"] > 0 and not test_gate_sent
+                    and time.monotonic() - loop_start >= cfg["test_gate_after"]):
+                gate_seq.value = gate_seq.value + 1
+                un_peak = 0.0
+                tap.un_peak.value = 0.0
+                test_gate_sent = True
+                log.info("TEST GATE: 已注入一次门控事件")
+            if cfg["kws_debug"] and time.monotonic() - last_prob_log >= 2.0:
+                log.info("KWS idle p=%.3f", tap.kws_prob.value)
+                last_prob_log = time.monotonic()
+            if speech.run(1) < 1:
+                log.warning("音频输入结束")
+                break
+    except KeyboardInterrupt:
+        log.info("收到 Ctrl+C")
+    finally:
+        stop_event.set()
+        if pwm_proc.is_alive():
+            pwm_proc.join(2.0)
+            if pwm_proc.is_alive():
+                pwm_proc.terminate()
+                pwm_proc.join(1.0)
+        _pwm_off(cfg["pwm6_path"])
+        _pwm_off(cfg["pwm7_path"])
+        tap.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

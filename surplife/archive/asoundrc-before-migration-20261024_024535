@@ -1,0 +1,15 @@
+# surplife: 关键词识别读麦克风的同时, 把同一份音频复制到管道供音量检测, 不影响默认设备
+pcm.surplife_mic {
+    type file
+    slave.pcm "hw:0,0"
+    file "/tmp/surplife_mic.pcm"
+    format "raw"
+}
+
+# voice_pwm: 独立麦克风分流, 不影响旧的 surplife_mic
+pcm.pwm_mic {
+    type file
+    slave.pcm "hw:0,0"
+    file "/tmp/surplife_pwm_mic.pcm"
+    format "raw"
+}

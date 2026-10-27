@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Surplife 窗帘灯控制器</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 600px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; color: #e94560; }
+        .card {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .card h2 {
+            font-size: 16px;
+            margin-bottom: 12px;
+            color: #8fa8d6;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: #e94560; color: #fff; }
+        .btn-primary:hover { background: #c73454; }
+        .btn-secondary { background: #0f3460; color: #fff; }
+        .btn-secondary:hover { background: #1a4a7a; }
+        .btn-success { background: #16c79a; color: #fff; }
+        .btn-success:hover { background: #13b389; }
+        .btn-danger { background: #e74c3c; color: #fff; }
+        .btn-danger:hover { background: #c0392b; }
+        input[type="range"] {
+            flex: 1;
+            height: 6px;
+            -webkit-appearance: none;
+            background: #0f3460;
+            border-radius: 3px;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            background: #e94560;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        input[type="text"], input[type="number"] {
+            padding: 8px 12px;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #1a1a2e;
+            color: #eee;
+            font-size: 14px;
+        }
+        select {
+            padding: 8px 12px;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #1a1a2e;
+            color: #eee;
+            font-size: 14px;
+        }
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 16px;
+            background: #0f3460;
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #e74c3c;
+        }
+        .status-indicator.connected { background: #16c79a; }
+        .value-display {
+            min-width: 40px;
+            text-align: right;
+            font-weight: 600;
+            color: #e94560;
+        }
+        .full-width { width: 100%; }
+        #log {
+            background: #0a0a1a;
+            border-radius: 8px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 150px;
+            overflow-y: auto;
+            color: #16c79a;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Surplife 窗帘灯控制器</h1>
+
+        <!-- 状态栏 -->
+        <div class="status-bar">
+            <div class="row" style="margin: 0;">
+                <div class="status-indicator" id="statusDot"></div>
+                <span id="statusText">未连接</span>
+            </div>
+            <span id="deviceAddress"></span>
+        </div>
+
+        <!-- 连接控制 -->
+        <div class="card">
+            <h2>连接</h2>
+            <div class="row">
+                <button class="btn-primary" onclick="scan()">扫描设备</button>
+                <button class="btn-success" onclick="connect()">连接</button>
+                <button class="btn-danger" onclick="disconnect()">断开</button>
+            </div>
+            <div class="row">
+                <input type="text" id="addrInput" placeholder="MAC 地址 (留空自动扫描)" class="full-width">
+            </div>
+        </div>
+
+        <!-- 电源 -->
+        <div class="card">
+            <h2>电源</h2>
+            <div class="row">
+                <button class="btn-success" onclick="setPower(true)">开启</button>
+                <button class="btn-danger" onclick="setPower(false)">关闭</button>
+            </div>
+        </div>
+
+        <!-- 颜色 -->
+        <div class="card">
+            <h2>颜色</h2>
+            <div class="row">
+                <span>色相</span>
+                <input type="range" id="hue" min="0" max="357" step="3" value="0" oninput="updateColor()">
+                <span class="value-display" id="hueVal">0</span>
+            </div>
+            <div class="row">
+                <span>亮度</span>
+                <input type="range" id="brightness" min="0" max="100" value="100" oninput="updateColor()">
+                <span class="value-display" id="brightnessVal">100</span>
+            </div>
+            <div class="row">
+                <span>饱和度</span>
+                <input type="range" id="saturation" min="0" max="100" value="100" oninput="updateColor()">
+                <span class="value-display" id="saturationVal">100</span>
+            </div>
+            <div class="row">
+                <div id="colorPreview" style="width:100%;height:40px;border-radius:8px;background:hsl(0,100%,50%);"></div>
+            </div>
+        </div>
+
+        <!-- 效果 -->
+        <div class="card">
+            <h2>效果模式</h2>
+            <div class="row">
+                <select id="effectId">
+                    <option value="0">效果 0</option>
+                    <option value="1">效果 1</option>
+                    <option value="2">效果 2</option>
+                    <option value="3">效果 3</option>
+                    <option value="4">效果 4</option>
+                    <option value="5">效果 5</option>
+                    <option value="6">效果 6</option>
+                    <option value="7">效果 7</option>
+                    <option value="8">效果 8</option>
+                    <option value="9">效果 9</option>
+                    <option value="10">效果 10</option>
+                    <option value="11">效果 11</option>
+                    <option value="12">效果 12</option>
+                    <option value="13">效果 13</option>
+                    <option value="14">效果 14</option>
+                    <option value="15">效果 15</option>
+                    <option value="16">效果 16</option>
+                    <option value="17">效果 17</option>
+                </select>
+            </div>
+            <div class="row">
+                <span>速度</span>
+                <input type="range" id="effectSpeed" min="0" max="100" value="50">
+                <span class="value-display" id="effectSpeedVal">50</span>
+            </div>
+            <div class="row">
+                <span>亮度</span>
+                <input type="range" id="effectBrightness" min="0" max="100" value="50">
+                <span class="value-display" id="effectBrightnessVal">50</span>
+            </div>
+            <div class="row">
+                <button class="btn-primary full-width" onclick="setEffect()">应用效果</button>
+            </div>
+        </div>
+
+        <!-- 全局亮度/速度 -->
+        <div class="card">
+            <h2>全局设置</h2>
+            <div class="row">
+                <span>亮度</span>
+                <input type="range" id="globalBrightness" min="0" max="100" value="50" oninput="setGlobalBrightness(this.value)">
+                <span class="value-display" id="globalBrightnessVal">50</span>
+            </div>
+            <div class="row">
+                <span>速度</span>
+                <input type="range" id="globalSpeed" min="0" max="100" value="50" oninput="setGlobalSpeed(this.value)">
+                <span class="value-display" id="globalSpeedVal">50</span>
+            </div>
+        </div>
+
+        <!-- 音乐模式 -->
+        <div class="card">
+            <h2>音乐模式</h2>
+            <div class="row">
+                <button class="btn-success" onclick="setMusic(true)">开启</button>
+                <button class="btn-danger" onclick="setMusic(false)">关闭</button>
+            </div>
+        </div>
+
+        <!-- 文本 -->
+        <div class="card">
+            <h2>文本显示</h2>
+            <div class="row">
+                <input type="text" id="textInput" placeholder="输入文本..." class="full-width" maxlength="64">
+            </div>
+            <div class="row">
+                <select id="textDir">
+                    <option value="left">向左滚动</option><option value="right">向右滚动</option>
+                    <option value="up">向上</option><option value="down">向下</option>
+                    <option value="fixed">固定</option><option value="twinkle">闪烁</option>
+                </select>
+            </div>
+            <div class="row">
+                <button class="btn-primary full-width" onclick="setText()">显示文本</button>
+            </div>
+        </div>
+
+        <!-- 日志 -->
+        <div class="card">
+            <h2>日志</h2>
+            <div id="log"></div>
+        </div>
+    </div>
+
+    <script>
+        const API = '';
+        // 服务端设置了 SURPLIFE_TOKEN 时, 打开 /static/index.html?token=xxx 即可保存
+        const qsToken = new URLSearchParams(location.search).get('token');
+        if (qsToken) localStorage.setItem('surplifeToken', qsToken);
+        const TOKEN = localStorage.getItem('surplifeToken');
+        let connected = false;
+
+        function log(msg) {
+            const el = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            el.innerHTML += `[${time}] ${msg}<br>`;
+            el.scrollTop = el.scrollHeight;
+        }
+
+        async function apiCall(method, path, body) {
+            try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (TOKEN) headers['X-Token'] = TOKEN;
+                const opts = { method, headers };
+                if (body) opts.body = JSON.stringify(body);
+                const res = await fetch(API + path, opts);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || '请求失败');
+                return data;
+            } catch (e) {
+                log(`错误: ${e.message}`);
+                throw e;
+            }
+        }
+
+        function updateStatus() {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            dot.className = 'status-indicator' + (connected ? ' connected' : '');
+            text.textContent = connected ? '已连接' : '未连接';
+        }
+
+        async function scan() {
+            log('扫描设备...');
+            const data = await apiCall('GET', '/scan');
+            log(`找到 ${data.devices.length} 个设备`);
+            if (data.devices.length > 0) {
+                document.getElementById('addrInput').value = data.devices[0].address;
+                log(`选择: ${data.devices[0].name} (${data.devices[0].address})`);
+            }
+        }
+
+        async function connect() {
+            const addr = document.getElementById('addrInput').value || null;
+            log('连接中...');
+            const data = await apiCall('POST', '/connect', { address: addr });
+            connected = true;
+            document.getElementById('deviceAddress').textContent = data.address;
+            updateStatus();
+            log(`已连接到 ${data.address}`);
+        }
+
+        async function disconnect() {
+            await apiCall('POST', '/disconnect');
+            connected = false;
+            document.getElementById('deviceAddress').textContent = '';
+            updateStatus();
+            log('已断开');
+        }
+
+        async function setPower(on) {
+            await apiCall('POST', '/power', { on });
+            log(`电源: ${on ? '开' : '关'}`);
+        }
+
+        function updateColor() {
+            const hue = +document.getElementById('hue').value;
+            const bri = +document.getElementById('brightness').value;
+            const sat = +document.getElementById('saturation').value;
+            document.getElementById('hueVal').textContent = hue;
+            document.getElementById('brightnessVal').textContent = bri;
+            document.getElementById('saturationVal').textContent = sat;
+            document.getElementById('colorPreview').style.background = `hsl(${hue}, ${sat}%, ${bri / 2}%)`;
+        }
+
+        async function setColor() {
+            const hue = +document.getElementById('hue').value;
+            const bri = +document.getElementById('brightness').value;
+            const saturation = +document.getElementById('saturation').value;
+            await apiCall('POST', '/color', { hue, saturation, brightness: bri });
+            log(`颜色: hue=${hue}, bri=${bri}`);
+        }
+
+        async function setEffect() {
+            const effect_id = +document.getElementById('effectId').value;
+            const speed = +document.getElementById('effectSpeed').value;
+            const brightness = +document.getElementById('effectBrightness').value;
+            await apiCall('POST', '/effect', { effect_id, speed, brightness });
+            log(`效果: id=${effect_id}, speed=${speed}, bri=${brightness}`);
+        }
+
+        async function setGlobalBrightness(val) {
+            document.getElementById('globalBrightnessVal').textContent = val;
+            await apiCall('POST', '/brightness', { value: +val });
+        }
+
+        async function setGlobalSpeed(val) {
+            document.getElementById('globalSpeedVal').textContent = val;
+            await apiCall('POST', '/speed', { value: +val });
+        }
+
+        async function setMusic(active) {
+            if (active) {
+                await apiCall('POST', '/music', { effect_id: 0 });
+            } else {
+                await setEffect();
+            }
+            log(`音乐模式: ${active ? '开' : '关 (切回效果模式)'}`);
+        }
+
+        async function setText() {
+            const text = document.getElementById('textInput').value;
+            if (!text) return;
+            await apiCall('POST', '/text', { text, direction: document.getElementById('textDir').value });
+            log(`文本: ${text}`);
+        }
+
+        // 颜色实时预览 + 防抖发送
+        let colorTimer;
+        document.getElementById('hue').addEventListener('input', () => {
+            updateColor();
+            clearTimeout(colorTimer);
+            colorTimer = setTimeout(setColor, 200);
+        });
+        ['brightness', 'saturation'].forEach(id => document.getElementById(id).addEventListener('input', () => {
+            updateColor();
+            clearTimeout(colorTimer);
+            colorTimer = setTimeout(setColor, 200);
+        }));
+
+        ['effectSpeed', 'effectBrightness'].forEach(id => document.getElementById(id).addEventListener('input', e => {
+            document.getElementById(id + 'Val').textContent = e.target.value;
+        }));
+
+        // 初始化: 读取服务端连接状态
+        apiCall('GET', '/status').then(d => {
+            connected = d.connected;
+            document.getElementById('deviceAddress').textContent = d.address || '';
+            updateStatus();
+        }).catch(() => {});
+        updateStatus();
+        log('控制器已加载');
+    </script>
+</body>
+</html>
