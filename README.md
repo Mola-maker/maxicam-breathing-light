@@ -38,6 +38,7 @@ cd surplife/app
 
 - [`surplife/README.md`](surplife/README.md)
 - [`surplife/app/README_pwm.md`](surplife/app/README_pwm.md)
+- [`surplife/app/README_TEMP_SENSOR.md`](surplife/app/README_TEMP_SENSOR.md)
 - [`surplife/app/README_lamp_ui.md`](surplife/app/README_lamp_ui.md)
 - [`maixcam/README.md`](maixcam/README.md)
 - [`light-dots/PROTOCOL.md`](light-dots/PROTOCOL.md)
