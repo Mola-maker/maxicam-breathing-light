@@ -10,7 +10,7 @@ MaixCAM 语音门控呼吸灯项目，以及相关的参考代码、协议笔记
 | --- | --- |
 | `surplife/` | MaixCAM 上的完整项目快照：语音 KWS、PWM 呼吸灯、触摸 UI、BLE/HTTP、测试、历史版本、截图和文本日志 |
 | `maixcam/` | MaixCAM-Pro YOLO11 姿态识别参考示例 |
-| `config/` | 主机端“语音关键词记录器”：通过 SSH 读取板子 `pwm.log` |
+| `config/` | 主机端日志工具：语音关键词记录器、CPU 温度记录器（通过 SSH 读取板子） |
 | `light-dots/` | Surplife 20x20 LED 窗帘 BLE 协议笔记、俄罗斯方块、相机参考 |
 
 ## 说明
