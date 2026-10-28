@@ -336,7 +336,7 @@ class PwmChannel:
 class PwmOutput:
     A18 = "/sys/class/pwm/pwmchip4/pwm2"
     A19 = "/sys/class/pwm/pwmchip4/pwm3"
-    PERIOD_NS = 55555  # 18.0 kHz
+    PERIOD_NS = 1_000_000  # 1.0 kHz
 
     def __init__(self):
         self.a18 = PwmChannel(self.A18, self.PERIOD_NS)
@@ -1315,7 +1315,7 @@ class LampUI:
             img.draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
                           C_AMBER, 1)
         text(img, 48, 7, "LUMEN", C_TEXT, "ui16")
-        text(img, 100, 10, "/18k", C_AMBER, "ui14")
+        text(img, 100, 10, "/1k", C_AMBER, "ui14")
         text(img, 48, 26, "VOICE-GATED PWM BENCH", C_TEXT3, "mono8")
 
         self._draw_tab("灯效", 202, self.view == "bench")
@@ -1630,7 +1630,7 @@ class LampUI:
         img.draw_rect(16, 378, 608, 54, hw_fill, -1)
         img.draw_rect(16, 378, 608, 54, C_LINE, 1)
         text(img, 28, 386, "HARDWARE OUTPUT", C_TEXT3, "mono9")
-        desc = "A18/PWM6 · A19/PWM7 · 18 kHz · 独占"
+        desc = "A18/PWM6 · A19/PWM7 · 1 kHz · 独占"
         if self.hw_error:
             desc = clip_text(self.hw_error, "ui9", 470)
             desc_color = C_RED
@@ -2052,7 +2052,7 @@ def voice_startup_prompt(ui, disp, ts):
         img.draw_rect(16, 18, 24, 24, C_PANEL_DEEP, -1)
         img.draw_rect(16, 18, 24, 24, C_AMBER_DIM, 1)
         text(img, 48, 15, "LUMEN", C_TEXT, "ui16")
-        text(img, 100, 18, "/18k", C_AMBER, "ui14")
+        text(img, 100, 18, "/1k", C_AMBER, "ui14")
         text(img, 48, 34, "VOICE-GATED PWM BENCH", C_TEXT3, "mono8")
 
         panel(img, 60, 96, 520, 278, C_PANEL, C_AMBER_DIM)
@@ -2302,7 +2302,7 @@ def main():
     boot.draw_rect(0, 0, W, H, C_BG, -1)
     boot.draw_rect(180, 188, 280, 104, C_PANEL, -1)
     boot.draw_rect(180, 188, 280, 104, C_AMBER_DIM, 1)
-    text(boot, 200, 208, "LUMEN / 18k", C_AMBER, "ui20")
+    text(boot, 200, 208, "LUMEN / 1k", C_AMBER, "ui20")
     text(boot, 200, 240, "正在构建设计层与灯效缓存…", C_TEXT2, "ui10")
     text(boot, 200, 262, "WARMING UP THE BENCH", C_TEXT3, "mono8")
     try:

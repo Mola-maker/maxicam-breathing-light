@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MaixCAM Pro 语音门控 18 kHz PWM 灯控
+MaixCAM Pro 语音门控 1 kHz PWM 灯控
 
 业务:
     语音门改成"单字/整词识别 + 时序拼装"两段:
@@ -35,7 +35,7 @@ MaixCAM Pro 语音门控 18 kHz PWM 灯控
 硬件:
     A18 -> PWM6 -> /sys/class/pwm/pwmchip4/pwm2
     A19 -> PWM7 -> /sys/class/pwm/pwmchip4/pwm3
-    载波 18 kHz, duty 0~100%。
+    载波 1 kHz, duty 0~100%。
     注意: A18/A19 是 3.3V 逻辑 PWM, 必须经过 MOSFET/驱动级,
     不得直接接灯珠或大电流负载。
 
@@ -67,7 +67,7 @@ MaixCAM Pro 语音门控 18 kHz PWM 灯控
     VOICE_INPUT_WAV       可选: 指定 WAV 文件用于离线调试 (DEVICE_WAV)
     VOICE_TAP_FIFO        默认 /root/surplife/run/surplife_mic.pcm
 
-    PWM_FREQ              载波频率, 默认 18000
+    PWM_FREQ              载波频率, 默认 1000
     PWM_UPDATE_HZ         PWM 更新率, 默认 100
     PWM6_PATH / PWM7_PATH sysfs 通道路径
     PWM7_MODE             freq | mirror | square | off, 默认 freq
@@ -821,7 +821,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def build_config() -> dict:
-    freq = max(1, _env_int("PWM_FREQ", 18000))
+    freq = max(1, _env_int("PWM_FREQ", 1000))
     mode = os.environ.get("PWM7_MODE", "freq").strip().lower()
     if mode not in ("freq", "mirror", "square", "off"):
         mode = "freq"

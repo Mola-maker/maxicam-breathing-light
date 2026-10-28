@@ -17,7 +17,7 @@ fi
 ps -o pid,ppid,rss,stat,args 2>/dev/null | grep -E "voice_pwm|python3" | grep -v grep || true
 
 echo ""
-echo "== PWM (18 kHz, period=55555 ns) =="
+echo "== PWM (1 kHz, period=1000000 ns) =="
 for d in /sys/class/pwm/pwmchip4/pwm2 /sys/class/pwm/pwmchip4/pwm3; do
     if [ -d "$d" ]; then
         PERIOD="$(cat "$d/period" 2>/dev/null)"

@@ -1,8 +1,8 @@
-# LUMEN / 18k — MaixCAM Pro 灯效测试 UI
+# LUMEN / 1k — MaixCAM Pro 灯效测试 UI
 
 640×480 触摸测试台。它不跑 KWS，也不改变已部署的 `voice_pwm.py` 逻辑；
 它用于手动注入“长春”门控、模拟人声、观察衰减/呼吸/时间线，并在需要时
-独占 A18/PWM6、A19/PWM7 输出 18 kHz 灯效。
+独占 A18/PWM6、A19/PWM7 输出 1 kHz 灯效。
 
 ## 启动
 

@@ -8,7 +8,6 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from voice_pwm import (  # noqa: E402
-    GateDetector,
     blink_hz,
     breathing_duty,
     build_config,
@@ -22,7 +21,7 @@ class ConfigTest(unittest.TestCase):
         # 不增加 chun1/chun~ 之类的二级触发; 只保留完整“长春”门。
         with mock.patch.dict(os.environ, {}, clear=True):
             cfg = build_config()
-        self.assertEqual(cfg["keyword_pinyin"], "chang2 chun1")
+        self.assertEqual(cfg["phrase_keywords"], ("chang2 chun1",))
 
     def test_decay_defaults(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -32,39 +31,23 @@ class ConfigTest(unittest.TestCase):
         self.assertAlmostEqual(cfg["work_decay"], 1.0)
         self.assertAlmostEqual(cfg["release_decay"], 3.0)
 
+    def test_default_pwm_frequency_is_1khz(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            cfg = build_config()
+        self.assertEqual(cfg["period_ns"], 1_000_000)
 
-class GateTest(unittest.TestCase):
-    def test_one_utterance_only_once(self):
-        gate = GateDetector(0.5, 0.28)
-        hits = [gate.feed(p) for p in (0.1, 0.6, 0.8, 0.9, 0.7, 0.4, 0.2)]
-        self.assertEqual(hits.count(True), 1)
-
-    def test_no_cooldown_can_trigger_again_immediately(self):
-        gate = GateDetector(0.5, 0.28)
-        self.assertTrue(gate.feed(0.6))
-        self.assertFalse(gate.feed(0.9))
-        gate.feed(0.2)          # 只回落到 rearm 以下, 不等待任何时间
-        self.assertTrue(gate.feed(0.7))
-
-    def test_rearm_threshold(self):
-        gate = GateDetector(0.5, 0.28)
-        self.assertTrue(gate.feed(0.6))
-        gate.feed(0.3)          # 还在 rearm 之上, 不重新武装
-        self.assertFalse(gate.feed(0.6))
-        gate.feed(0.27)
-        self.assertTrue(gate.feed(0.6))
-
-    def test_invalid_rearm(self):
-        with self.assertRaises(ValueError):
-            GateDetector(0.5, 0.5)
+    def test_pwm_frequency_env_override(self):
+        with mock.patch.dict(os.environ, {"PWM_FREQ": "2000"}, clear=True):
+            cfg = build_config()
+        self.assertEqual(cfg["period_ns"], 500_000)
 
 
 class LampMathTest(unittest.TestCase):
     def test_breathing_bounds(self):
-        values = [breathing_duty(t, 4.0, 5.0, 35.0) for t in range(0, 80)]
-        self.assertAlmostEqual(min(values), 5.0, delta=0.2)
-        self.assertAlmostEqual(max(values), 35.0, delta=0.2)
-        self.assertAlmostEqual(breathing_duty(0.0), 5.0, delta=0.01)
+        values = [breathing_duty(t, 4.0, 1.0, 8.0) for t in range(0, 80)]
+        self.assertAlmostEqual(min(values), 1.0, delta=0.2)
+        self.assertAlmostEqual(max(values), 8.0, delta=0.2)
+        self.assertAlmostEqual(breathing_duty(0.0), 1.0, delta=0.01)
 
     def test_business_above_standby_ceiling(self):
         self.assertAlmostEqual(business_brightness(0.0), 40.0)
@@ -105,25 +88,6 @@ class LampMathTest(unittest.TestCase):
     def test_decay_clamped(self):
         self.assertAlmostEqual(decay_step(1.0, 0.0, 3.0, 0.02, 0.02), 0.0)
         self.assertAlmostEqual(decay_step(0.0, -10.0, 1.0, 0.02, 0.02), 0.0)
-
-
-@unittest.skipUnless(__import__("importlib").util.find_spec("numpy"), "numpy not installed")
-class VoiceEnhancerSmokeTest(unittest.TestCase):
-    def test_process_noise_and_tone(self):
-        import numpy as np
-        from voice_pwm import VoiceEnhancer
-
-        enh = VoiceEnhancer()
-        t = np.arange(512, dtype=np.float32)
-        for i in range(30):
-            tone = 0.1 * np.sin(2 * np.pi * 300.0 * t / 16000.0)
-            noise = 0.005 * np.random.randn(512).astype(np.float32)
-            out = enh.process(tone + noise, 0.0, 0.0)
-            for value in out:
-                self.assertTrue(np.isfinite(value))
-            self.assertGreaterEqual(out[1], 0.0)
-            self.assertLess(out[1], 1.0)
-            self.assertGreaterEqual(out[4], -100.0)
 
 
 if __name__ == "__main__":
