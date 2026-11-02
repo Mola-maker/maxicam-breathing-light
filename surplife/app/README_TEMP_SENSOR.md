@@ -102,6 +102,20 @@ JSON 示例：
   SIGSEGV/SIGBUS，因此工具不使用 Python mmap；`devmem` 读取稳定。
 - 工具不会启用/关闭传感器，也不会改阈值；内核驱动仍然拥有 TEMPSEN。
 
+## 与 STM32 的职责划分（规划）
+
+后续 MaixCAM 与 STM32 通过 SPI 通信，生产链路按以下边界划分：
+
+- **MaixCAM**：负责语音 KWS/识别和智能决策；读取 SG2002 结温；把温度数据和
+  控制命令通过 SPI 发给 STM32。
+- **STM32**：负责输出 **15 路 PWM 波** 和功率级；接收 MaixCAM 的语音决策结果，
+  可选承担加热、风扇等温控执行。
+- 温度读取应在 MaixCAM 的常驻进程中直接 `import sg2002_temp`，按不高于 1 Hz
+  调用 `sample("sysfs")` 或 `read_sysfs_mc()`；不要每秒启动一次外部 CLI 进程。
+- 无线 1 Hz 温度记录器（`config/cpu_temperature_logger.py` 等）只是主机端调试
+  工具，保留在 `feature/sg2002-temp-sensor`，不进入 `main`，也不属于 SPI 生产链路。
+- SPI 上报建议直接传整数 `temp_mc`，避免浮点端序和精度问题。
+
 ## 低温使用建议
 
 1. **以 sysfs 为准。** 它经过内核驱动和 thermal framework，单位统一为 m°C，
