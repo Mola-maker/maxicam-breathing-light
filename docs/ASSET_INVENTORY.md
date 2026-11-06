@@ -2,7 +2,7 @@
 
 生成时间：2026-11-06  
 项目：语音控制的灯牌 PWM 效果  
-仓库：`Mola-maker/maxicam-breathing-light`，`main` 分支
+仓库：`Mola-maker/EnlightenJLU`，`main` 分支
 
 ## 1. 来源与处置
 
