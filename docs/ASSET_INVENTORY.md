@@ -14,11 +14,7 @@
 | MaixCAM2 `/root/models/sensevoice-maixcam2` | SenseVoice 权重和运行支撑 | 支撑文件复制到 `model/maixcam2/`；权重外置 |
 | MaixCAM Pro `/root/models/am_3332_192_int8.mud` | 一代 KWS 权重/描述 | 未复制；仅记录 |
 
-清理前工作树备份（工作站临时文件，不属于仓库）：
-
-```text
-/home/jlu/桌面/EnlightenJLU_old_worktree_backup.tar.gz
-```
+清理前目标目录所在文件系统在当前会话中是只读挂载，未能生成额外本地备份；旧版本仍可通过远端 Git 历史和一代 MaixCAM Pro 设备追溯。
 
 ## 2. 新结构
 
