@@ -235,11 +235,42 @@ void app_perf_init(uint32_t now_ms)
 
 void app_perf_tick(uint32_t now_ms)
 {
+    uint16_t lamp_duty[(uint32_t)BOARD_PWM_PWM13 + 1U] = { 0U };
+
     for (uint32_t i = 0; i < (uint32_t)GLYPH_COUNT; i++)
     {
         uint16_t duty = tick_one(&s_glyphs[i], now_ms);
         s_glyphs[i].duty_permille = duty;
-        board_pwm_set_duty(g_glyph_map[i].pwm_id, duty);
+
+        if ((glyph_id_t)i == GLYPH_ALL_LAMPS)
+        {
+            /* Test-only aggregate: PWM1..PWM13 are lamps, HEAT1/2 excluded. */
+            for (uint32_t pwm = (uint32_t)BOARD_PWM_PWM1;
+                 pwm <= (uint32_t)BOARD_PWM_PWM13; pwm++)
+            {
+                if (duty > lamp_duty[pwm])
+                {
+                    lamp_duty[pwm] = duty;
+                }
+            }
+        }
+        else if ((uint32_t)g_glyph_map[i].pwm_id <=
+                 (uint32_t)BOARD_PWM_PWM13)
+        {
+            uint32_t pwm = (uint32_t)g_glyph_map[i].pwm_id;
+
+            if (duty > lamp_duty[pwm])
+            {
+                lamp_duty[pwm] = duty;
+            }
+        }
+        /* Glyphs mapped to HEAT1/HEAT2 are intentionally ignored here. */
+    }
+
+    for (uint32_t pwm = (uint32_t)BOARD_PWM_PWM1;
+         pwm <= (uint32_t)BOARD_PWM_PWM13; pwm++)
+    {
+        board_pwm_set_duty((board_pwm_id_t)pwm, lamp_duty[pwm]);
     }
 }
 

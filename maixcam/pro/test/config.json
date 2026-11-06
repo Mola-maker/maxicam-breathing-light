@@ -1,0 +1,15 @@
+{
+  "model": "/root/models/am_3332_192_int8.mud",
+  "alsa_device": "surplife_mic",
+  "spi_bus": 3,
+  "spi_device": 0,
+  "spi_frequency": 1000000,
+  "all_lamps_mask": 4,
+  "hold_seconds": 1.2,
+  "standby_on_start": false,
+  "temperature": {"interval_seconds": 1.0, "source": "sysfs"},
+  "keywords": [
+    {"label": "hello", "display": "hello（哈喽）", "kws": "ha1 lou2", "threshold": 0.20, "cooldown": 2.0},
+    {"label": "welcome", "display": "welcome（威尔康）", "kws": "wei1 er2 kang1", "threshold": 0.10, "cooldown": 2.0}
+  ]
+}

@@ -13,7 +13,8 @@ extern "C" {
  * stable numeric glyph IDs and bit masks. */
 #define GLYPH_TABLE(X) \
     X(GLYPH_CHANG, "长", BOARD_PWM_PWM1) \
-    X(GLYPH_CHUN,  "春", BOARD_PWM_PWM2)
+    X(GLYPH_CHUN,  "春", BOARD_PWM_PWM2) \
+    X(GLYPH_ALL_LAMPS, "全灯", BOARD_PWM_PWM1)
 
 typedef enum
 {
@@ -37,6 +38,9 @@ extern const glyph_map_t g_glyph_map[GLYPH_COUNT];
 /* Current single-word "长春" performance targets both character boards. */
 #define WORD_CHANGCHUN_MASK \
     (GLYPH_BIT(GLYPH_CHANG) | GLYPH_BIT(GLYPH_CHUN))
+
+/* Test-only group: all 13 lamp outputs, never HEAT1/HEAT2. */
+#define ALL_LAMPS_MASK GLYPH_BIT(GLYPH_ALL_LAMPS)
 
 #ifdef __cplusplus
 }

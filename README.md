@@ -244,6 +244,17 @@ TIM4 CR1=0x00000081 PSC=8  ARR=399  CCR1..3=0
 
 说明新固件运行，15 路输出和 6 个功率电阻全关。
 
+2026-11-06 已用同一 ST-Link V2 烧录 MaixCAM Pro 测试扩展固件并校验通过：
+
+```text
+PWM-Heater-test.bin
+SHA256 5fcb600380c41cd2619e35c9e5158ee10e6a86e7c56c53df17ff6707ff81ca78
+```
+
+该固件包含 `GLYPH_ALL_LAMPS`（PWM1–PWM13，排除 HEAT1/2）、USART3 `[temp]`
+打印，以及按最大占空比聚合灯牌输出的修正。MaixCAM Pro 尚未接回，SPI、13 路灯牌
+动作和温度打印仍需整机联调。
+
 已知限制：
 
 - SPI 时序和完整 15 路灯牌尚未系统级联调；

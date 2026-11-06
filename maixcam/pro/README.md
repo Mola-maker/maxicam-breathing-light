@@ -79,3 +79,14 @@ python3 -m unittest -v tests/test_voice_pwm.py tests/test_sg2002_temp.py
 ```
 
 真机 KWS/PWM 仍需在 Pro 上验证。
+
+## SPI / 英文关键词测试
+
+`test/` 是当前 MaixCAM Pro 技术验证用的 SPI + 关键词 + 温度上报测试：
+
+- `/dev/spidev3.0`（SPI4，A22–A25）连接 STM32；
+- 现有中文 KWS 模型用 `ha1 lou2` / `wei1 er2 kang1` 作为 hello/welcome 近音代理；
+- 触发后发送 `PERFORM mask=0x4`，驱动 STM32 PWM1–PWM13，排除 HEAT1/HEAT2；
+- 1 Hz 读取 SG2002 温度并通过 `TEMP` TLV 发送，STM32 USART3 打印 `[temp]`。
+
+详见 `test/README.md`。

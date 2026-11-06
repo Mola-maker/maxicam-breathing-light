@@ -267,6 +267,14 @@ static void handle_temp(const uint8_t *value, uint8_t length, uint32_t now_ms)
     {
         s_faults |= FAULT_TEMP_INVALID;
     }
+
+    /* The host sends one sample per second in the test firmware. */
+    app_debug_printf("[temp] %ld mC seq=%u age=%ums valid=%u source=%u\r\n",
+                     (long)temp_mc,
+                     (unsigned int)sample_seq,
+                     (unsigned int)age_ms,
+                     valid ? 1U : 0U,
+                     (unsigned int)source);
 }
 
 static void handle_perform(const uint8_t *value, uint8_t length,
