@@ -6,7 +6,11 @@ __pycache__/
 venv/
 env/
 
-# Runtime / hardware artifacts
+# Runtime files and generated logs
+logs/
+run/
+artifacts/
+*.log
 *.pcm
 *.pid
 *.lock
@@ -16,18 +20,20 @@ env/
 *.m4a
 *.flac
 
-# Models and binary blobs
-models/
-*.mud
-*.cvimodel
-*.gguf
-*.onnx
+# Model weights (descriptors/support stay tracked)
+model/**/*.axmodel
+model/**/*.cvimodel
+model/**/*.onnx
+model/**/*.gguf
+model/**/*.pt
+model/**/*.pth
+model/**/*.bin
 
-# Dependencies kept out of the public snapshot
-lib/
-wheels/
+# STM32 build output
+stm32/build/
+build/
 
-# Local editor / OS files
+# Editor / OS
 .DS_Store
 *.swp
 *~

@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "project": "EnlightenJLU / voice-controlled light-board PWM",
+  "policy": "model descriptors and support code tracked; large weights external",
+  "models": {
+    "maixcam_pro_kws": {
+      "target": "MaixCAM / MaixCAM Pro (SG2002, 128 MB)",
+      "engine": "Maix-Speech nn.Speech keyword spotting",
+      "descriptor": "/root/models/am_3332_192_int8.mud",
+      "tracked_in_git": false,
+      "reason": "weights exist on the first-generation device and are not present in this workspace",
+      "keywords": [
+        "chang1",
+        "chang2",
+        "chang4",
+        "chun1",
+        "chun2",
+        "chun3",
+        "ang1",
+        "ang2",
+        "chang2 chun1"
+      ],
+      "documentation": "model/maixcam_pro/README.md"
+    },
+    "maixcam2_sensevoice": {
+      "target": "MaixCAM2 (AX620E/AX630C)",
+      "engine": "MaixPy SenseVoice / SenseVoiceAx",
+      "runtime_dir": "/root/models/sensevoice-maixcam2",
+      "descriptor": "model/maixcam2/sensevoice.mud",
+      "tracked_support_files": [
+        {
+          "path": "SenseVoiceAx.py",
+          "size": 23098,
+          "sha256": "a9d338a2f9564b6823761e50de394d930b15fdda255faf846539364760934efa"
+        },
+        {
+          "path": "am.mvn",
+          "size": 11203,
+          "sha256": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5"
+        },
+        {
+          "path": "chn_jpn_yue_eng_ko_spectok.bpe.model",
+          "size": 377341,
+          "sha256": "aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8"
+        },
+        {
+          "path": "client.py",
+          "size": 11254,
+          "sha256": "03713982d50db0b2c5e00532d115c265ed90adec447a0cc520b3ebc8201d4822"
+        },
+        {
+          "path": "embeddings.npy",
+          "size": 25523,
+          "sha256": "2a453244ab037744531b97bcb8574c8442301dac11f6406fdab208dddb83b93e"
+        },
+        {
+          "path": "frontend.py",
+          "size": 17726,
+          "sha256": "2797cec8586fe6194215a636adcc4674348e6ea4b9d4c9fb093b43a037b8dba7"
+        },
+        {
+          "path": "model.mud",
+          "size": 317,
+          "sha256": "be48ad5920c0081dca131df3457803f7074bbeee572013b4fa75ea054950be88"
+        },
+        {
+          "path": "pe_nonstream.npy",
+          "size": 573568,
+          "sha256": "0f1c9c550bd62fa164a959517f52d46a28591812fafdf002df0df2bd998f44b5"
+        },
+        {
+          "path": "pe_streaming.npy",
+          "size": 58368,
+          "sha256": "54fec2fe2670168d36678c5857e65c459c634e6b6d6df928b7d415399ce2c291"
+        },
+        {
+          "path": "server.py",
+          "size": 11282,
+          "sha256": "21ad44930792021605bc3b4be0b152299ae534b112c573589025f3b80cc871d9"
+        },
+        {
+          "path": "tokenizer.py",
+          "size": 4810,
+          "sha256": "a1757481bfd3c74792370a8cac26c26867a6889f09498decc2757fada8ac91e3"
+        }
+      ],
+      "external_weights": [
+        {
+          "path": "sensevoice.axmodel",
+          "size": 256550253,
+          "sha256": "67d290cf7cebf45db5f37b2e93b8bdfff44dc35110bb29d84204a5f9eae9fd4d"
+        },
+        {
+          "path": "streaming_sensevoice.axmodel",
+          "size": 249023211,
+          "sha256": "ba1ddd60841297903bfdae059ad88092d0fd1c543e1d80d7f64199d4e27b8263"
+        }
+      ],
+      "documentation": "model/maixcam2/README.md"
+    }
+  }
+}

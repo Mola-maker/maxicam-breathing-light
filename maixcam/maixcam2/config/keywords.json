@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "model_mud": "config/sensevoice.mud",
+  "language": "zh",
+  "char_families": {
+    "chang": {
+      "display": "长",
+      "registered_keywords": ["chang1", "chang2", "chang4"],
+      "aliases": ["长", "常", "场", "厂", "唱", "昌", "畅", "尝", "肠", "偿", "敞", "倡"]
+    },
+    "chun": {
+      "display": "春",
+      "registered_keywords": ["chun1", "chun2", "chun3"],
+      "aliases": ["春", "纯", "唇", "醇", "淳", "蠢", "椿", "鹑"]
+    },
+    "ang": {
+      "display": "昂",
+      "registered_keywords": ["ang1", "ang2"],
+      "aliases": ["昂", "肮", "盎"]
+    }
+  },
+  "phrase": {
+    "id": "chang2 chun1",
+    "display": "长春",
+    "aliases": ["长春", "长 春"],
+    "glyph_mask": 3
+  },
+  "gate": {
+    "phrase_only": true,
+    "glyph_mask": 3,
+    "hold_seconds": 1.2
+  }
+}
